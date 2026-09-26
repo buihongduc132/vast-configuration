@@ -1,0 +1,57 @@
+# =============================================================================
+# vast:* — Vast.ai GPU rental lifecycle management
+# Repo: vast-configuration (submodule of noco-mesh-infra at vendor/vast-configuration)
+# Plan: noco-mesh-infra/flow/plans/vast-ai-gpu-offload.md
+# =============================================================================
+
+[env]
+VAST_CONFIG_DIR = "{{config_root}}"
+
+# ── Test ────────────────────────────────────────────────────────────────────
+
+[tasks."vast:test"]
+description = "Offline test suite — no network, no credentials, $0"
+run = "cd ${VAST_CONFIG_DIR} && npx vitest run"
+
+[tasks."vast:typecheck"]
+description = "Typecheck with this repo's own tsconfig (strict + noUncheckedIndexedAccess)"
+run = "cd ${VAST_CONFIG_DIR} && npx tsc --noEmit"
+
+[tasks."vast:test:live"]
+description = "READ-ONLY live API tests (needs credentials, costs $0). Rentals need VAST_LIVE_CONFIRM."
+run = "cd ${VAST_CONFIG_DIR} && VAST_LIVE=1 npx vitest run"
+
+# ── Inspect (read-only) ─────────────────────────────────────────────────────
+
+[tasks."vast:whoami"]
+description = "Account id, credit remaining, can-pay status"
+run = "cd ${VAST_CONFIG_DIR} && npx tsx bin/vast.ts whoami"
+
+[tasks."vast:instances"]
+description = "Current rentals + hourly burn + accrued cost (flags foreign instances)"
+run = "cd ${VAST_CONFIG_DIR} && npx tsx bin/vast.ts instances"
+
+[tasks."vast:offers"]
+description = "Eligible offers for a workload. Usage: mise run vast:offers embedding|qwen"
+run = "cd ${VAST_CONFIG_DIR} && npx tsx bin/vast.ts offers"
+
+[tasks."vast:limits"]
+description = "Show the spend ceilings enforced before any rent"
+run = "cd ${VAST_CONFIG_DIR} && npx tsx bin/vast.ts limits"
+
+# ── Guard ───────────────────────────────────────────────────────────────────
+
+[tasks."vast:submodule-pin-check"]
+description = "Assert the pinned submodule SHA is reachable on origin/main (pre-push guard)"
+run = """
+cd ${VAST_CONFIG_DIR}
+SHA=$(git rev-parse HEAD)
+git fetch --quiet origin main
+if git merge-base --is-ancestor "$SHA" origin/main; then
+  echo "OK: $SHA is on origin/main"
+else
+  echo "FAIL: $SHA is NOT on origin/main — push this submodule BEFORE the superproject," >&2
+  echo "      or every fresh clone breaks with 'reference is not a tree'." >&2
+  exit 1
+fi
+"""

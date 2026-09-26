@@ -13,3 +13,10 @@ secrets.json
 state/local/
 *.log
 .worktrees/
+
+# Un-ignore our CLI source: ~/.gitignore_global:40 has `/bin/`, which silently
+# swallowed bin/vast.ts on `git add -A` — the file existed on disk, so every
+# local check passed while a fresh clone got a repo whose `npm run vast` fails
+# (exit-127 class). tests/scripts-exist.test.ts is the guard that caught it.
+!/bin/
+!/bin/**

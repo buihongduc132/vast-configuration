@@ -9,7 +9,7 @@
   },
   "scripts": {
     "test": "vitest run",
-    "test:live": "VAST_LIVE=1 vitest run --testNamePattern=live",
+    "test:live": "VAST_LIVE=1 vitest run",
     "typecheck": "tsc --noEmit",
     "vast": "tsx bin/vast.ts"
   },
