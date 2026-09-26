@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { selectOffer, NoEligibleOffersError, type VastOffer } from "../src/offers/select.js";
+import {
+  selectOffer,
+  selectCandidateOffers,
+  isGeoExcluded,
+  NoEligibleOffersError,
+  type VastOffer,
+} from "../src/offers/select.js";
 import { EMBEDDING_WORKLOAD, QWEN_WORKLOAD } from "../src/workloads.js";
 import { SPEND_LIMITS } from "../src/limits.js";
 
@@ -140,4 +146,98 @@ describe("selectOffer", () => {
   it("throws NoEligibleOffersError when given empty offers array", () => {
     expect(() => selectOffer(QWEN_WORKLOAD, [])).toThrow(NoEligibleOffersError);
   });
+
+  it("excludes CN geolocation offers by default", () => {
+    const cnOffer: VastOffer = {
+      ...baseOffer,
+      id: 501,
+      geolocation: "Fujian, CN",
+    };
+    const usOffer: VastOffer = {
+      ...baseOffer,
+      id: 502,
+      geolocation: "Pennsylvania, US",
+    };
+
+    const selected = selectOffer(EMBEDDING_WORKLOAD, [cnOffer, usOffer]);
+    expect(selected.id).toBe(502);
+
+    // If only CN offers exist, throws NoEligibleOffersError by default
+    expect(() => selectOffer(EMBEDDING_WORKLOAD, [cnOffer])).toThrow(NoEligibleOffersError);
+  });
+
+  it("allows overriding geo-exclusion via options", () => {
+    const cnOffer: VastOffer = {
+      ...baseOffer,
+      id: 501,
+      geolocation: "CN",
+    };
+
+    // Disabling geo-exclusion allows CN offer
+    const selected = selectOffer(EMBEDDING_WORKLOAD, [cnOffer], { excludeGeo: [] });
+    expect(selected.id).toBe(501);
+
+    // Excluding US excludes US offer
+    const usOffer: VastOffer = {
+      ...baseOffer,
+      id: 502,
+      geolocation: "US",
+    };
+    expect(() => selectOffer(EMBEDDING_WORKLOAD, [usOffer], { excludeGeo: ["US"] })).toThrow(
+      NoEligibleOffersError,
+    );
+  });
+
+  it("selectCandidateOffers returns ranked list of all eligible candidates", () => {
+    const offer1: VastOffer = {
+      ...baseOffer,
+      id: 601,
+      reliability2: 0.90,
+      dph_total: 0.20,
+      geolocation: "US",
+    };
+    const offer2: VastOffer = {
+      ...baseOffer,
+      id: 602,
+      reliability2: 0.98,
+      dph_total: 0.30,
+      geolocation: "DE",
+    };
+    const offer3: VastOffer = {
+      ...baseOffer,
+      id: 603,
+      reliability2: 0.95,
+      dph_total: 0.15,
+      geolocation: "CA",
+    };
+    const cnOffer: VastOffer = {
+      ...baseOffer,
+      id: 604,
+      reliability2: 0.99,
+      dph_total: 0.10,
+      geolocation: "CN", // excluded by default
+    };
+
+    const candidates = selectCandidateOffers(EMBEDDING_WORKLOAD, [
+      offer1,
+      offer2,
+      offer3,
+      cnOffer,
+    ]);
+
+    // CN is excluded; order is reliability2 desc: offer2 (0.98), offer3 (0.95), offer1 (0.90)
+    expect(candidates.map((c) => c.id)).toEqual([602, 603, 601]);
+  });
+
+  it("isGeoExcluded correctly identifies country codes with word boundaries", () => {
+    expect(isGeoExcluded("Fujian, CN")).toBe(true);
+    expect(isGeoExcluded("CN")).toBe(true);
+    expect(isGeoExcluded("cn")).toBe(true);
+    expect(isGeoExcluded("Pennsylvania, US")).toBe(false);
+    expect(isGeoExcluded("US")).toBe(false);
+    expect(isGeoExcluded(undefined)).toBe(false);
+    expect(isGeoExcluded(null)).toBe(false);
+    expect(isGeoExcluded("CN", [])).toBe(false);
+  });
 });
+

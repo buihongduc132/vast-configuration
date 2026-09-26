@@ -2,7 +2,8 @@
 // =============================================================================
 // Deterministic offer selection for Vast.ai rentals.
 //
-// Filters out undersized, overpriced, or unrentable offers, then sorts by:
+// Filters out undersized, overpriced, unrentable, or geo-excluded offers,
+// then sorts candidates by:
 //   1. reliability2 (higher is better)
 //   2. dph_total (lower is better)
 //   3. inet_down (higher is better)
@@ -28,6 +29,13 @@ export interface VastOffer {
   readonly [key: string]: unknown;
 }
 
+export interface SelectOffersOptions {
+  /** Country / region codes to exclude from candidate selection. Default: ["CN"]. */
+  readonly excludeGeo?: readonly string[];
+  /** Maximum hourly price in USD. Default: SPEND_LIMITS.maxDphTotal. */
+  readonly maxDphTotal?: number;
+}
+
 export class NoEligibleOffersError extends Error {
   readonly workload: WorkloadSpec;
   readonly totalOffersConsidered: number;
@@ -45,20 +53,44 @@ export class NoEligibleOffersError extends Error {
 }
 
 /**
- * Filter and rank offers for a workload. Returns the single best matching offer
- * or throws NoEligibleOffersError if none qualify.
+ * Returns true if the offer's geolocation matches any excluded region code.
+ * Excludes CN by default because hosts behind national firewalls routinely fail
+ * to reach registries (ghcr.io, Hugging Face, etc.).
  */
-export function selectOffer(
+export function isGeoExcluded(
+  geolocation: string | undefined | null,
+  excludeGeo: readonly string[] = ["CN"],
+): boolean {
+  if (!geolocation || excludeGeo.length === 0) return false;
+  const upperGeo = geolocation.toUpperCase();
+  return excludeGeo.some((code) => {
+    const upperCode = code.trim().toUpperCase();
+    if (!upperCode) return false;
+    const regex = new RegExp(`\\b${upperCode}\\b`);
+    return regex.test(upperGeo);
+  });
+}
+
+/**
+ * Filter and rank offers for a workload. Returns a list of all qualifying candidates
+ * ordered by reliability2 desc, dph_total asc, inet_down desc.
+ * Throws NoEligibleOffersError if none qualify.
+ */
+export function selectCandidateOffers(
   workload: WorkloadSpec | WorkloadId,
   offers: readonly VastOffer[],
-): VastOffer {
+  options?: SelectOffersOptions,
+): VastOffer[] {
   const spec = typeof workload === "string" ? getWorkload(workload) : workload;
+  const maxDph = options?.maxDphTotal ?? SPEND_LIMITS.maxDphTotal;
+  const excludeGeo = options?.excludeGeo ?? ["CN"];
 
   const eligible = offers.filter((o) => {
     if (!o.rentable) return false;
     if (o.gpu_ram < spec.minGpuRamMb) return false;
     if (o.disk_space < spec.minDiskGb) return false;
-    if (o.dph_total > SPEND_LIMITS.maxDphTotal) return false;
+    if (o.dph_total > maxDph) return false;
+    if (isGeoExcluded(o.geolocation, excludeGeo)) return false;
     return true;
   });
 
@@ -67,7 +99,7 @@ export function selectOffer(
   }
 
   // Sort: prefer higher reliability2, then lower dph_total, then higher inet_down
-  const sorted = [...eligible].sort((a, b) => {
+  return [...eligible].sort((a, b) => {
     const relA = a.reliability2 ?? 0;
     const relB = b.reliability2 ?? 0;
     if (relA !== relB) {
@@ -82,9 +114,21 @@ export function selectOffer(
     const netB = b.inet_down ?? 0;
     return netB - netA; // higher first
   });
+}
 
-  const best = sorted[0];
+/**
+ * Filter and rank offers for a workload. Returns the single best matching offer
+ * or throws NoEligibleOffersError if none qualify.
+ */
+export function selectOffer(
+  workload: WorkloadSpec | WorkloadId,
+  offers: readonly VastOffer[],
+  options?: SelectOffersOptions,
+): VastOffer {
+  const candidates = selectCandidateOffers(workload, offers, options);
+  const best = candidates[0];
   if (!best) {
+    const spec = typeof workload === "string" ? getWorkload(workload) : workload;
     throw new NoEligibleOffersError(spec, offers.length);
   }
   return best;
