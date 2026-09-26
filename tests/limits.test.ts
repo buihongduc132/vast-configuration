@@ -108,7 +108,7 @@ describe("the CLI actually runs outside the test runner", () => {
     expect(out).toContain("whoami");
   }, 90_000);
 
-  it("refuses money-spending commands instead of half-doing them", () => {
+  it("refuses money-spending rent command without confirmation token", () => {
     let status = 0;
     let stderr = "";
     try {
@@ -117,6 +117,7 @@ describe("the CLI actually runs outside the test runner", () => {
         encoding: "utf8",
         timeout: 60_000,
         stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, VAST_LIVE_CONFIRM: "" },
       });
     } catch (err) {
       const e = err as { status?: number; stderr?: string };
@@ -124,6 +125,6 @@ describe("the CLI actually runs outside the test runner", () => {
       stderr = e.stderr ?? "";
     }
     expect(status).toBe(2);
-    expect(stderr).toContain("not implemented");
+    expect(stderr).toContain("VAST_LIVE_CONFIRM=i-accept-gpu-rental-charges");
   }, 90_000);
 });
