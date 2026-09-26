@@ -8,6 +8,13 @@
 // The dangerous window is between "API created the instance" and "we recorded
 // its id". By writing the intent first with a unique greppable label, an
 // independent reaper can find and clean up the instance if our process dies.
+//
+// ⚠️ FOOTGUN RESOLUTIONS (verified live 2026-09-27):
+// 1. Offer volatility: an offer can vanish between search and rent. The API
+//    answers `no_such_ask` / `invalid_args`. We catch this, clean up intent,
+//    and advance across a ranked candidate list.
+// 2. Price ceiling re-assertion: every candidate retry re-asserts the cap.
+// 3. Host-level failure: detect early via status_msg, destroy, advance.
 // =============================================================================
 
 import { VastClient } from "../api/client.js";
@@ -16,7 +23,13 @@ import { getWorkload, type WorkloadId, type WorkloadSpec } from "../workloads.js
 import { makeLeaseIntent, type Lease, type LeaseIntent } from "./lease.js";
 import { putLease, deleteLease, type KvOptions } from "../state/kv.js";
 import { buildEmbeddingProvisionConfig, type WorkloadProvisionConfig } from "../provision/embedding.js";
-import { type VastOffer } from "../offers/select.js";
+import { type VastOffer, NoEligibleOffersError } from "../offers/select.js";
+import { destroyInstance } from "./destroy.js";
+import {
+  waitForInstanceReady,
+  FatalHostError,
+  TerminalInstanceStateError,
+} from "./status.js";
 
 /** Token the operator must set in VAST_LIVE_CONFIRM to authorize renting real GPUs. */
 export const RENT_CONFIRM_TOKEN = "i-accept-gpu-rental-charges";
@@ -29,6 +42,35 @@ export class VastRentRefusalError extends Error {
     this.name = "VastRentRefusalError";
     this.reason = reason;
   }
+}
+
+export class VastNoSuchAskError extends Error {
+  readonly offerId: number;
+  readonly details?: unknown;
+
+  constructor(offerId: number, message: string, details?: unknown) {
+    super(`Vast.ai offer ${offerId} unavailable: ${message}`);
+    this.name = "VastNoSuchAskError";
+    this.offerId = offerId;
+    this.details = details;
+  }
+}
+
+/** Check if an error represents offer volatility (no_such_ask or invalid_args). */
+export function isNoSuchAskError(err: unknown): boolean {
+  if (err instanceof VastNoSuchAskError) return true;
+  if (!err || typeof err !== "object") return false;
+  const msg = (err as Error).message?.toLowerCase() ?? "";
+  if (msg.includes("no_such_ask") || msg.includes("not available")) return true;
+  if ("body" in err && err.body && typeof err.body === "object") {
+    const b = err.body as Record<string, unknown>;
+    const bErr = String(b.error ?? "").toLowerCase();
+    const bMsg = String(b.msg ?? "").toLowerCase();
+    if (bErr === "invalid_args" || bMsg.includes("no_such_ask") || bMsg.includes("not available")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface RentInstanceArgs {
@@ -147,7 +189,15 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
     }>(`/asks/${args.offer.id}`, rentBody);
 
     if (res.success === false) {
-      throw new Error(`Vast.ai rent rejected: ${res.msg ?? res.error ?? "unknown reason"}`);
+      const msg = res.msg ?? res.error ?? "unknown reason";
+      if (
+        res.error === "invalid_args" ||
+        msg.toLowerCase().includes("no_such_ask") ||
+        msg.toLowerCase().includes("not available")
+      ) {
+        throw new VastNoSuchAskError(args.offer.id, msg, res);
+      }
+      throw new Error(`Vast.ai rent rejected: ${msg}`);
     }
 
     const idCandidate = res.new_contract ?? res.instance_id ?? res.id;
@@ -164,6 +214,16 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
       await removeIntent(intent.label);
     } catch {
       // Don't mask the primary rent failure if KV cleanup errors
+    }
+    if (isNoSuchAskError(err)) {
+      if (err instanceof VastNoSuchAskError) {
+        throw err;
+      }
+      throw new VastNoSuchAskError(
+        args.offer.id,
+        (err as Error).message,
+        (err as { body?: unknown }).body,
+      );
     }
     throw err;
   }
@@ -182,3 +242,119 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
     dphTotal: intent.dphTotal,
   };
 }
+
+export interface RentCandidatesArgs {
+  readonly workload: WorkloadSpec | WorkloadId;
+  readonly candidates: readonly VastOffer[];
+  readonly maxAttempts?: number;
+  readonly owner?: string;
+  readonly maxLifetimeMinutes?: number;
+  readonly client?: VastClient;
+  readonly kvOptions?: KvOptions;
+  readonly provisionConfig?: WorkloadProvisionConfig;
+  readonly putLeaseFn?: (lease: Lease | LeaseIntent) => Promise<void>;
+  readonly deleteLeaseFn?: (label: string) => Promise<void>;
+  readonly creditUsd?: number;
+  readonly currentInstanceCount?: number;
+  readonly rentInstanceFn?: (args: RentInstanceArgs) => Promise<RentResult>;
+  readonly destroyFn?: (instanceId: number) => Promise<unknown>;
+  readonly waitForReady?: boolean;
+  readonly candidateDeadlineMs?: number;
+  readonly pollIntervalMs?: number;
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly now?: () => number;
+}
+
+/**
+ * Walk a ranked candidate list and advance to the next candidate when the rent call
+ * returns no_such_ask / invalid_args or when host-level failure is detected.
+ * Bounded by maxAttempts. Re-asserts the spend ceiling per candidate.
+ */
+export async function rentFirstAvailable(args: RentCandidatesArgs): Promise<RentResult> {
+  const spec = typeof args.workload === "string" ? getWorkload(args.workload) : args.workload;
+  const candidates = args.candidates;
+
+  if (!candidates || candidates.length === 0) {
+    throw new NoEligibleOffersError(spec, 0);
+  }
+
+  const maxAttempts = Math.min(args.maxAttempts ?? 4, candidates.length);
+  const client = args.client ?? new VastClient();
+  const rentFn = args.rentInstanceFn ?? rentInstance;
+  const destroyFn =
+    args.destroyFn ?? ((id) => destroyInstance(id, { client, kvOptions: args.kvOptions }));
+  const sleep = args.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const now = args.now ?? (() => Date.now());
+
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const candidate = candidates[attempt]!;
+
+    // Re-assert the price ceiling per candidate — never rent above cap on a retry
+    if (candidate.dph_total > SPEND_LIMITS.maxDphTotal) {
+      throw new VastRentRefusalError(
+        `offer $${candidate.dph_total.toFixed(4)}/hr exceeds the $${SPEND_LIMITS.maxDphTotal}/hr cap`,
+      );
+    }
+
+    let rentResult: RentResult;
+    try {
+      rentResult = await rentFn({
+        workload: spec,
+        offer: candidate,
+        owner: args.owner,
+        maxLifetimeMinutes: args.maxLifetimeMinutes,
+        client,
+        kvOptions: args.kvOptions,
+        provisionConfig: args.provisionConfig,
+        putLeaseFn: args.putLeaseFn,
+        deleteLeaseFn: args.deleteLeaseFn,
+        creditUsd: args.creditUsd,
+        currentInstanceCount: args.currentInstanceCount,
+      });
+    } catch (err) {
+      if (isNoSuchAskError(err)) {
+        lastError = err as Error;
+        continue;
+      }
+      throw err;
+    }
+
+    if (args.waitForReady) {
+      try {
+        const readyInstance = await waitForInstanceReady(rentResult.instanceId, {
+          client,
+          timeoutMs: args.candidateDeadlineMs ?? 9 * 60_000,
+          pollIntervalMs: args.pollIntervalMs ?? 15_000,
+          sleep,
+          now,
+        });
+
+        // Live instance price update (price drift)
+        const actualDph =
+          readyInstance.dph_total != null ? Number(readyInstance.dph_total) : rentResult.dphTotal;
+
+        return {
+          instanceId: rentResult.instanceId,
+          label: rentResult.label,
+          dphTotal: actualDph,
+        };
+      } catch (err) {
+        if (err instanceof FatalHostError || err instanceof TerminalInstanceStateError) {
+          // Host-level failure or terminal state on this box: destroy and advance
+          await destroyFn(rentResult.instanceId);
+          lastError = err;
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    return rentResult;
+  }
+
+  throw lastError ?? new Error(`Failed to rent after ${maxAttempts} attempt(s)`);
+}
+
+export const rentCandidateOffers = rentFirstAvailable;
