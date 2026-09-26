@@ -198,3 +198,114 @@ export async function waitForInstanceReady(
 
   throw new Error(`Instance ${instanceId} did not reach running state within ${timeoutMs}ms`);
 }
+
+/** Strip ANSI color and control escape sequences. */
+export function stripAnsi(text: string): string {
+  if (!text) return "";
+  return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
+}
+
+export type BackendDevice = "cuda" | "cpu" | "unknown";
+
+export const CPU_BACKEND_PATTERNS = [
+  "using cpu instead",
+  "model on cpu",
+  "cuda is not available",
+  "cuda_error_compat_not_supported",
+] as const;
+
+/**
+ * Classify the backend compute device (cuda vs cpu vs unknown) from container log text.
+ * Returns:
+ *   - "cpu" if logs indicate CUDA failure or fallback to CPU
+ *   - "cuda" if logs indicate model loaded on CUDA
+ *   - "unknown" otherwise (unknown is NEVER assumed to be cuda)
+ */
+export function classifyBackendDevice(logText: string | null | undefined): BackendDevice {
+  if (!logText) return "unknown";
+  const clean = stripAnsi(logText);
+  const lower = clean.toLowerCase();
+
+  for (const pattern of CPU_BACKEND_PATTERNS) {
+    if (lower.includes(pattern)) {
+      return "cpu";
+    }
+  }
+
+  // Matches "model on cuda" or "starting <x> model on cuda"
+  if (/model\s+on\s+cuda/i.test(clean) || /starting\s+\S+\s+model\s+on\s+cuda/i.test(clean)) {
+    return "cuda";
+  }
+
+  return "unknown";
+}
+
+export class CpuBackendError extends FatalHostError {
+  constructor(instanceId: number, details?: string) {
+    const msg = `Silent CPU fallback detected: model running on CPU instead of GPU${details ? ` (${details})` : ""}`;
+    super(instanceId, msg);
+    this.name = "CpuBackendError";
+  }
+}
+
+export interface FetchLogsOptions {
+  readonly client?: VastClient;
+  readonly tail?: string | number;
+  readonly fetch?: typeof fetch;
+  readonly maxAttempts?: number;
+  readonly retryDelayMs?: number;
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly stripAnsi?: boolean;
+}
+
+/**
+ * Fetch container logs from Vast.ai:
+ * 1. PUT /instances/request_logs/<id>/ returns a signed S3 URL
+ * 2. Poll the S3 URL until the log appears
+ * 3. Strip ANSI escape sequences by default
+ */
+export async function fetchInstanceLogs(
+  instanceId: number,
+  options?: FetchLogsOptions,
+): Promise<string> {
+  const client = options?.client ?? new VastClient();
+  const tail = options?.tail ?? "60";
+  const fetchImpl = options?.fetch ?? globalThis.fetch;
+  const maxAttempts = options?.maxAttempts ?? 5;
+  const retryDelayMs = options?.retryDelayMs ?? 1000;
+  const sleep = options?.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const shouldStripAnsi = options?.stripAnsi ?? true;
+
+  const res = await client.put<{
+    success?: boolean;
+    result_url?: string;
+    msg?: string;
+    error?: string;
+  }>(`/instances/request_logs/${instanceId}/`, { tail: String(tail) });
+
+  if (!res || res.success === false || !res.result_url) {
+    const errDetail = res?.msg ?? res?.error ?? JSON.stringify(res);
+    throw new Error(`Failed to request logs for instance ${instanceId}: ${errDetail}`);
+  }
+
+  const resultUrl = res.result_url;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const logRes = await fetchImpl(resultUrl);
+      if (logRes.ok) {
+        const text = await logRes.text();
+        return shouldStripAnsi ? stripAnsi(text) : text;
+      }
+    } catch {
+      // transient network or log not uploaded yet
+    }
+    if (attempt < maxAttempts - 1) {
+      await sleep(retryDelayMs);
+    }
+  }
+
+  throw new Error(
+    `Failed to fetch log from ${resultUrl} for instance ${instanceId} after ${maxAttempts} attempts`,
+  );
+}
