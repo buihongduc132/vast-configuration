@@ -8,7 +8,9 @@ import {
   EmbeddingDimensionMismatchError,
   verifyBackendDevice,
   verifyProvisioning,
+  waitForEndpointHealth,
   CpuBackendError,
+  POST_CONTAINER_HEALTH_DEADLINE_MS,
 } from "../src/provision/verify.js";
 import { FatalHostError } from "../src/instances/status.js";
 import {
@@ -224,3 +226,87 @@ describe("verifyProvisioning (src/provision/verify.ts)", () => {
     expect(result.dimension).toBe(1024);
   });
 });
+
+describe("waitForEndpointHealth (src/provision/verify.ts)", () => {
+  it("polls until /health returns HTTP 200 within POST_CONTAINER_HEALTH_DEADLINE_MS", async () => {
+    expect(POST_CONTAINER_HEALTH_DEADLINE_MS).toBe(12 * 60_000); // 12m
+
+    let calls = 0;
+    const mockFetch = vi.fn().mockImplementation(async (url: string) => {
+      calls++;
+      expect(url).toBe("http://vast-box:8003/health");
+      if (calls < 3) {
+        return new Response("Service Unavailable", { status: 503 });
+      }
+      return new Response("OK", { status: 200 });
+    });
+
+    const sleepCalls: number[] = [];
+    const mockSleep = async (ms: number) => {
+      sleepCalls.push(ms);
+    };
+
+    let fakeTime = 10_000;
+    const nowFn = () => {
+      fakeTime += 1000;
+      return fakeTime;
+    };
+
+    const res = await waitForEndpointHealth("http://vast-box:8003", {
+      fetch: mockFetch as typeof fetch,
+      sleep: mockSleep,
+      now: nowFn,
+      pollIntervalMs: 2000,
+    });
+
+    expect(res.healthy).toBe(true);
+    expect(calls).toBe(3);
+    expect(sleepCalls).toEqual([2000, 2000]);
+  });
+
+  it("checks container logs early and rejects immediately on CPU fallback before health timeout", async () => {
+    const cpuLog = `
+WARN text_embeddings_backend_candle: Could not find a compatible CUDA device on host: CUDA is not available
+Caused by:
+    DriverError(CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE, "forward compatibility was attempted on non supported HW")
+WARN text_embeddings_backend_candle: Using CPU instead
+INFO text_embeddings_backend_candle: Starting Qwen3 model on Cpu
+`;
+    const fetchLogsSpy = vi.fn().mockResolvedValue(cpuLog);
+    const mockFetch = vi.fn().mockResolvedValue(new Response("Starting...", { status: 503 }));
+
+    await expect(
+      waitForEndpointHealth("http://vast-box:8003", {
+        checkBackendEarly: true,
+        instanceId: 555,
+        fetchLogs: fetchLogsSpy,
+        fetch: mockFetch as typeof fetch,
+        timeoutMs: 10_000,
+        pollIntervalMs: 1,
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow(CpuBackendError);
+
+    expect(fetchLogsSpy).toHaveBeenCalledWith(555);
+  });
+
+  it("throws when endpoint never becomes healthy within deadline", async () => {
+    const mockFetch = vi.fn().mockResolvedValue(new Response("Not Ready", { status: 503 }));
+
+    let fakeTime = 0;
+    const nowFn = () => {
+      fakeTime += 5000;
+      return fakeTime;
+    };
+
+    await expect(
+      waitForEndpointHealth("http://vast-box:8003", {
+        fetch: mockFetch as typeof fetch,
+        timeoutMs: 10_000,
+        now: nowFn,
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow(/did not report healthy within 10000ms/);
+  });
+});
+

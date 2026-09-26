@@ -30,7 +30,11 @@ import {
   waitForInstanceReady,
   FatalHostError,
   TerminalInstanceStateError,
+  CpuBackendError,
+  assertBackendVerified,
+  PRE_CONTAINER_START_DEADLINE_MS,
 } from "./status.js";
+import { HostBlocklist } from "./blocklist.js";
 import { verifyBackendDevice } from "../provision/verify.js";
 
 /** Token the operator must set in VAST_LIVE_CONFIRM to authorize renting real GPUs. */
@@ -319,6 +323,8 @@ export interface RentCandidatesArgs {
   readonly pollIntervalMs?: number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly now?: () => number;
+  readonly blocklist?: HostBlocklist;
+  readonly blocklistPath?: string;
 }
 
 /**
@@ -341,6 +347,9 @@ export async function rentFirstAvailable(args: RentCandidatesArgs): Promise<Rent
     args.destroyFn ?? ((id) => destroyInstance(id, { client, kvOptions: args.kvOptions }));
   const sleep = args.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = args.now ?? (() => Date.now());
+  const blocklist =
+    args.blocklist ??
+    (args.blocklistPath ? new HostBlocklist({ filePath: args.blocklistPath, now }) : undefined);
 
   let lastError: Error | undefined;
 
@@ -385,19 +394,20 @@ export async function rentFirstAvailable(args: RentCandidatesArgs): Promise<Rent
       try {
         const readyInstance = await waitForInstanceReady(rentResult.instanceId, {
           client,
-          timeoutMs: args.candidateDeadlineMs ?? 9 * 60_000,
+          timeoutMs: args.candidateDeadlineMs ?? PRE_CONTAINER_START_DEADLINE_MS,
           pollIntervalMs: args.pollIntervalMs ?? 15_000,
           sleep,
           now,
         });
 
-        // Backend device assertion: CPU fallback must be treated as fatal-host failure
+        // Backend device assertion: CPU fallback or unverified must be treated as fatal-host failure
         if (args.verifyBackend) {
-          await verifyBackendDevice(rentResult.instanceId, {
+          const backendResult = await verifyBackendDevice(rentResult.instanceId, {
             client,
             fetchLogs: args.fetchLogsFn,
             onWarning: args.onWarning,
           });
+          assertBackendVerified(backendResult, rentResult.instanceId);
         }
 
         // Live instance price update (price drift)
@@ -411,6 +421,17 @@ export async function rentFirstAvailable(args: RentCandidatesArgs): Promise<Rent
         };
       } catch (err) {
         if (err instanceof FatalHostError || err instanceof TerminalInstanceStateError) {
+          // Record machine to blocklist if machine_id is known
+          if (candidate.machine_id != null && blocklist) {
+            const reason =
+              err instanceof CpuBackendError
+                ? "cpu-fallback"
+                : err instanceof FatalHostError
+                  ? `host-fail:${err.statusMsg}`
+                  : `terminal:${(err as TerminalInstanceStateError).actualStatus}`;
+            await blocklist.add(candidate.machine_id, reason).catch(() => {});
+          }
+
           // Host-level failure or terminal state on this box: destroy and advance
           await destroyFn(rentResult.instanceId);
           lastError = err;

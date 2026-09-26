@@ -7,9 +7,16 @@ import {
   stripAnsi,
   fetchInstanceLogs,
   CpuBackendError,
+  UnknownBackendError,
   FatalHostError,
   waitForInstanceReady,
   TerminalInstanceStateError,
+  isBackendVerified,
+  assertBackendVerified,
+  PRE_CONTAINER_START_DEADLINE_MS,
+  POST_CONTAINER_HEALTH_DEADLINE_MS,
+  CANDIDATE_DEADLINE_MS,
+  HEALTH_WAIT_DEADLINE_MS,
 } from "../src/instances/status.js";
 import { VastClient } from "../src/api/client.js";
 
@@ -163,8 +170,64 @@ INFO text_embeddings_router: Warming up model
 2026-09-27T01:00:10Z INFO text_embeddings_router: Model loaded and ready to serve
 `;
 
-  it("classifies VERBATIM live failure log excerpt as cpu", () => {
+  it("classifies real live incident on 2026-09-27 (cuda 12.2 / 12.8 silent CPU fallback) as cpu", () => {
     expect(classifyBackendDevice(verbatimCpuLog)).toBe("cpu");
+  });
+
+  it("classifies the exact same incident log excerpt ANSI-colorised as cpu (regression guard)", () => {
+    // Real tracing-subscriber ANSI escape sequences from Rust TEI container logs
+    const ansiColorisedIncident =
+      "\x1b[2m2026-09-27T00:46:17.319089Z\x1b[0m \x1b[33m WARN\x1b[0m \x1b[2mtext_embeddings_backend_candle\x1b[0m\x1b[2m:\x1b[0m Could not find a compatible CUDA device on host: CUDA is not available\n" +
+      "Caused by:\n" +
+      "    DriverError(CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE, \"forward compatibility was attempted on non supported HW\")\n" +
+      "\x1b[2m2026-09-27T00:46:17.319120Z\x1b[0m \x1b[33m WARN\x1b[0m \x1b[2mtext_embeddings_backend_candle\x1b[0m\x1b[2m:\x1b[0m Using CPU instead\n" +
+      "\x1b[2m2026-09-27T00:46:17.319150Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mtext_embeddings_backend_candle\x1b[0m\x1b[2m:\x1b[0m Starting Qwen3 model on Cpu\n" +
+      "\x1b[2m2026-09-27T00:46:17.319200Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mtext_embeddings_router\x1b[0m\x1b[2m:\x1b[0m Warming up model\n";
+
+    expect(classifyBackendDevice(ansiColorisedIncident)).toBe("cpu");
+  });
+
+  it("classifies healthy CUDA startup log as cuda", () => {
+    expect(classifyBackendDevice(cudaLog)).toBe("cuda");
+    const ansiCuda =
+      "\x1b[2m2026-09-27T01:00:00Z\x1b[0m \x1b[32m INFO\x1b[0m text_embeddings_backend_candle: Starting Qwen3 model on Cuda\n" +
+      "\x1b[2m2026-09-27T01:00:05Z\x1b[0m \x1b[32m INFO\x1b[0m text_embeddings_router: Warming up model\n";
+    expect(classifyBackendDevice(ansiCuda)).toBe("cuda");
+  });
+
+  it("classifies empty log, truncated log, and log with no device line as unknown, and caller helpers treat unknown as NOT verified", () => {
+    const emptyLogs = ["", "   \n  \t", null, undefined];
+    for (const empty of emptyLogs) {
+      expect(classifyBackendDevice(empty)).toBe("unknown");
+    }
+
+    const truncatedLog = "2026-09-27T01:00:00Z INFO text_embeddings_backend_candle: St";
+    expect(classifyBackendDevice(truncatedLog)).toBe("unknown");
+
+    const noDeviceLineLog =
+      "2026-09-27T01:00:00Z INFO text_embeddings_router: Listening on port 8003\n" +
+      "2026-09-27T01:00:01Z INFO text_embeddings_router: Ready for queries\n";
+    expect(classifyBackendDevice(noDeviceLineLog)).toBe("unknown");
+
+    // Caller helper isBackendVerified explicitly treats unknown as NOT verified (false)
+    expect(isBackendVerified("unknown")).toBe(false);
+    expect(isBackendVerified("cpu")).toBe(false);
+    expect(isBackendVerified(null)).toBe(false);
+    expect(isBackendVerified(undefined)).toBe(false);
+    expect(isBackendVerified({ device: "unknown" })).toBe(false);
+    expect(isBackendVerified({ backend: "unknown" })).toBe(false);
+    expect(isBackendVerified({ device: "cpu" })).toBe(false);
+
+    // Only 'cuda' is verified
+    expect(isBackendVerified("cuda")).toBe(true);
+    expect(isBackendVerified({ device: "cuda" })).toBe(true);
+    expect(isBackendVerified({ backend: "cuda" })).toBe(true);
+
+    // Caller helper assertBackendVerified throws UnknownBackendError on unknown
+    expect(() => assertBackendVerified("unknown", 404)).toThrow(UnknownBackendError);
+    expect(() => assertBackendVerified({ device: "unknown" }, 404)).toThrow(UnknownBackendError);
+    expect(() => assertBackendVerified("cpu", 404)).toThrow(CpuBackendError);
+    expect(() => assertBackendVerified("cuda", 404)).not.toThrow();
   });
 
   it("classifies all individual cpu fallback patterns as cpu", () => {
@@ -188,14 +251,6 @@ INFO text_embeddings_router: Warming up model
     expect(classifyBackendDevice("starting Qwen3 model on Cuda")).toBe("cuda");
   });
 
-  it("classifies unknown/garbage as unknown (must NOT default to cuda)", () => {
-    expect(classifyBackendDevice("Container started. Listening on :8003")).toBe("unknown");
-    expect(classifyBackendDevice("")).toBe("unknown");
-    expect(classifyBackendDevice("   \n  ")).toBe("unknown");
-    expect(classifyBackendDevice(null)).toBe("unknown");
-    expect(classifyBackendDevice(undefined)).toBe("unknown");
-  });
-
   it("strips ANSI color escapes before classification", () => {
     const colorizedCpu =
       "\x1b[33mWARN\x1b[0m \x1b[1;31musing cpu instead\x1b[0m of gpu";
@@ -211,12 +266,101 @@ INFO text_embeddings_router: Warming up model
     expect(stripAnsi(raw)).toBe("Red text and Bold Blue");
   });
 
-  it("CpuBackendError extends FatalHostError", () => {
-    const err = new CpuBackendError(999, "degraded to cpu");
-    expect(err).toBeInstanceOf(FatalHostError);
-    expect(err.name).toBe("CpuBackendError");
-    expect(err.instanceId).toBe(999);
-    expect(err.message).toContain("CPU fallback");
+  it("CpuBackendError and UnknownBackendError extend FatalHostError", () => {
+    const cpuErr = new CpuBackendError(999, "degraded to cpu");
+    expect(cpuErr).toBeInstanceOf(FatalHostError);
+    expect(cpuErr.name).toBe("CpuBackendError");
+    expect(cpuErr.instanceId).toBe(999);
+    expect(cpuErr.message).toContain("CPU fallback");
+
+    const unknownErr = new UnknownBackendError(888, "unverified device");
+    expect(unknownErr).toBeInstanceOf(FatalHostError);
+    expect(unknownErr.name).toBe("UnknownBackendError");
+    expect(unknownErr.instanceId).toBe(888);
+    expect(unknownErr.message).toContain("could not be verified");
+  });
+
+  it("each of the three real fatal host strings is classified fatal and NOT confused with cpu", () => {
+    const realFatalStrings = [
+      "dial tcp: lookup ghcr.io: no such host",
+      "OCI runtime create failed: could not apply required modification to OCI specification",
+      "failed to create task for container",
+    ];
+
+    for (const msg of realFatalStrings) {
+      // Must be classified as fatal-host
+      expect(isFatalHostStatusMsg(msg), `expected isFatalHostStatusMsg for "${msg}"`).toBe(true);
+      expect(classifyStatusMsg(msg), `expected fatal-host for "${msg}"`).toBe("fatal-host");
+
+      // Must NEVER be confused with CPU fallback
+      const deviceClassification = classifyBackendDevice(msg);
+      expect(deviceClassification, `expected not cpu for "${msg}"`).not.toBe("cpu");
+      expect(deviceClassification).toBe("unknown");
+    }
+  });
+
+  it("normal progress lines (Pull complete, Extracting, Verifying Checksum, Download complete) are NOT fatal", () => {
+    const progressLines = [
+      "Pull complete",
+      "Extracting",
+      "Verifying Checksum",
+      "Download complete",
+    ];
+
+    for (const line of progressLines) {
+      expect(isFatalHostStatusMsg(line), `expected non-fatal for "${line}"`).toBe(false);
+      expect(classifyStatusMsg(line)).toBe("progress");
+    }
+  });
+
+  it("the two deadlines are independent: a 206s pull does not trip the pre-container deadline if the container has already started", async () => {
+    // 1. Verify named values
+    expect(PRE_CONTAINER_START_DEADLINE_MS).toBe(7 * 60_000); // 7m = 420s
+    expect(POST_CONTAINER_HEALTH_DEADLINE_MS).toBe(12 * 60_000); // 12m = 720s
+    expect(CANDIDATE_DEADLINE_MS).toBe(PRE_CONTAINER_START_DEADLINE_MS);
+    expect(HEALTH_WAIT_DEADLINE_MS).toBe(POST_CONTAINER_HEALTH_DEADLINE_MS);
+
+    // 2. Simulate image pull alone taking 206s on a good box
+    let simulatedTime = 1_000_000;
+    const nowFn = () => simulatedTime;
+
+    const pullDurationMs = 206_000; // 206s measured image pull
+    let polls = 0;
+
+    const mockClient = {
+      get: async () => {
+        polls++;
+        if (polls === 1) {
+          // Poll 1: still pulling
+          simulatedTime += 100_000;
+          return { instances: [{ id: 1001, actual_status: "loading", status_msg: "Extracting" }] };
+        }
+        if (polls === 2) {
+          // Poll 2: finished 206s pull, container now started
+          simulatedTime += 106_000;
+          return { instances: [{ id: 1001, actual_status: "running", cur_state: "running" }] };
+        }
+        return { instances: [{ id: 1001, actual_status: "running" }] };
+      },
+    } as unknown as VastClient;
+
+    const sleepCalls: number[] = [];
+    const mockSleep = async (ms: number) => {
+      sleepCalls.push(ms);
+    };
+
+    // waitForInstanceReady completes in 206s, well under PRE_CONTAINER_START_DEADLINE_MS (420s)
+    const inst = await waitForInstanceReady(1001, {
+      client: mockClient,
+      timeoutMs: PRE_CONTAINER_START_DEADLINE_MS,
+      pollIntervalMs: 15_000,
+      sleep: mockSleep,
+      now: nowFn,
+    });
+
+    expect(inst.actual_status).toBe("running");
+    expect(simulatedTime - 1_000_000).toBe(pullDurationMs);
+    // Did NOT trip the pre-container deadline!
   });
 });
 
