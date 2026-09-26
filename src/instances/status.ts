@@ -31,6 +31,7 @@ export const NORMAL_PROGRESS_PATTERNS = [
   "extracting",
   "downloading",
   "verifying checksum",
+  "download complete",
 ] as const;
 
 /**
@@ -138,6 +139,22 @@ export class TerminalInstanceStateError extends Error {
   }
 }
 
+/**
+ * Short pre-container deadline: host must prove it can pull the image and start
+ * the container. Image pull alone was measured taking 206s on a healthy box.
+ * 7 minutes (420s) gives ample room for pull + start while failing fast on broken hosts.
+ */
+export const PRE_CONTAINER_START_DEADLINE_MS = 7 * 60_000; // 420,000 ms (7m)
+export const CANDIDATE_DEADLINE_MS = PRE_CONTAINER_START_DEADLINE_MS;
+
+/**
+ * Generous post-container health wait deadline: once the container is running and mapped,
+ * weights download and model warmup (e.g. Qwen3-Embedding-0.6B) gets its own generous budget.
+ * Conflating pre-container and health wait kills healthy boxes mid-cold-start.
+ */
+export const POST_CONTAINER_HEALTH_DEADLINE_MS = 12 * 60_000; // 720,000 ms (12m)
+export const HEALTH_WAIT_DEADLINE_MS = POST_CONTAINER_HEALTH_DEADLINE_MS;
+
 export interface WaitForInstanceOptions {
   readonly client?: VastClient;
   readonly timeoutMs?: number;
@@ -156,7 +173,7 @@ export async function waitForInstanceReady(
   options?: WaitForInstanceOptions,
 ): Promise<InstanceStateInput> {
   const client = options?.client ?? new VastClient();
-  const timeoutMs = options?.timeoutMs ?? 9 * 60_000;
+  const timeoutMs = options?.timeoutMs ?? PRE_CONTAINER_START_DEADLINE_MS;
   const pollIntervalMs = options?.pollIntervalMs ?? 15_000;
   const sleep = options?.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = options?.now ?? (() => Date.now());
@@ -232,8 +249,8 @@ export function classifyBackendDevice(logText: string | null | undefined): Backe
     }
   }
 
-  // Matches "model on cuda" or "starting <x> model on cuda"
-  if (/model\s+on\s+cuda/i.test(clean) || /starting\s+\S+\s+model\s+on\s+cuda/i.test(clean)) {
+  // Matches "model on cuda" or "starting <x> model on cuda" (single or multi-word)
+  if (/model\s+on\s+cuda/i.test(clean) || /starting\s+.*?\bmodel\s+on\s+cuda\b/i.test(clean)) {
     return "cuda";
   }
 
@@ -245,6 +262,60 @@ export class CpuBackendError extends FatalHostError {
     const msg = `Silent CPU fallback detected: model running on CPU instead of GPU${details ? ` (${details})` : ""}`;
     super(instanceId, msg);
     this.name = "CpuBackendError";
+  }
+}
+
+export class UnknownBackendError extends FatalHostError {
+  constructor(instanceId: number, details?: string) {
+    const msg = `Backend device could not be verified from container logs: ${details ?? "unknown device"}`;
+    super(instanceId, msg);
+    this.name = "UnknownBackendError";
+  }
+}
+
+/**
+ * Returns true ONLY if backend device is confirmed to be 'cuda'.
+ * Explicitly treats 'unknown' as NOT verified (returns false).
+ * Explicitly treats 'cpu' as NOT verified (returns false).
+ */
+export function isBackendVerified(
+  target: BackendDevice | { device?: BackendDevice; backend?: BackendDevice } | null | undefined,
+): target is "cuda" | { device: "cuda" } | { backend: "cuda" } {
+  if (!target) return false;
+  if (typeof target === "string") {
+    return target === "cuda";
+  }
+  if (typeof target === "object") {
+    if ("backend" in target && target.backend !== undefined) {
+      return target.backend === "cuda";
+    }
+    if ("device" in target && target.device !== undefined) {
+      return target.device === "cuda";
+    }
+  }
+  return false;
+}
+
+/**
+ * Assert that a backend device is verified ('cuda').
+ * Throws CpuBackendError if device is 'cpu'.
+ * Throws UnknownBackendError if device is 'unknown'.
+ */
+export function assertBackendVerified(
+  target: BackendDevice | { device?: BackendDevice; backend?: BackendDevice } | null | undefined,
+  instanceId = 0,
+): asserts target is "cuda" | { device: "cuda" } | { backend: "cuda" } {
+  const device = !target
+    ? "unknown"
+    : typeof target === "string"
+      ? target
+      : (target.backend ?? target.device ?? "unknown");
+
+  if (device === "cpu") {
+    throw new CpuBackendError(instanceId, "Container logs indicate CPU backend fallback");
+  }
+  if (device === "unknown") {
+    throw new UnknownBackendError(instanceId, "Container logs did not confirm CUDA backend");
   }
 }
 

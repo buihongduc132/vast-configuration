@@ -13,11 +13,13 @@
 
 import { SPEND_LIMITS } from "../limits.js";
 import { getWorkload, type WorkloadId, type WorkloadSpec } from "../workloads.js";
+import { HostBlocklist, loadBlocklist } from "../instances/blocklist.js";
 
 export const DEFAULT_MIN_CUDA = 12.8;
 
 export interface VastOffer {
   readonly id: number;
+  readonly machine_id?: number | string;
   readonly gpu_name?: string;
   readonly num_gpus?: number;
   readonly gpu_ram: number;
@@ -43,6 +45,14 @@ export interface SelectOffersOptions {
   readonly maxDphPerInstance?: number;
   /** Minimum CUDA version required (from cuda_max_good). Default: DEFAULT_MIN_CUDA (12.8). */
   readonly minCuda?: number;
+  /** Host blocklist instance, Set of blocked machine IDs, or array of blocked machine IDs. */
+  readonly blocklist?: HostBlocklist | ReadonlySet<number | string> | readonly (number | string)[];
+  /** Path to blocklist file to load dynamically. */
+  readonly blocklistPath?: string;
+  /** Blocklist TTL in milliseconds. */
+  readonly blocklistTtlMs?: number;
+  /** Clock override for blocklist expiry checks. */
+  readonly now?: () => number;
 }
 
 export class NoEligibleOffersError extends Error {
@@ -97,6 +107,26 @@ export function selectCandidateOffers(
   const excludeGeo = options?.excludeGeo ?? ["CN"];
   const minCuda = options?.minCuda !== undefined ? options.minCuda : DEFAULT_MIN_CUDA;
 
+  let blockedSet: ReadonlySet<number | string> | undefined;
+  if (options?.blocklist) {
+    if (typeof options.blocklist === "object" && "getBlockedMachineIds" in options.blocklist) {
+      blockedSet = options.blocklist.getBlockedMachineIds();
+    } else if (options.blocklist instanceof Set) {
+      blockedSet = options.blocklist;
+    } else if (Array.isArray(options.blocklist)) {
+      blockedSet = new Set(options.blocklist);
+    }
+  } else if (options?.blocklistPath) {
+    try {
+      blockedSet = loadBlocklist(options.blocklistPath, {
+        ttlMs: options.blocklistTtlMs,
+        now: options.now,
+      });
+    } catch {
+      // Fail safe: unreadable blocklist must not crash selection
+    }
+  }
+
   const eligible = offers.filter((o) => {
     if (!o.rentable) return false;
     if (o.gpu_ram < spec.minGpuRamMb) return false;
@@ -108,6 +138,13 @@ export function selectCandidateOffers(
     if (isGeoExcluded(o.geolocation, excludeGeo)) return false;
     const cuda = o.cuda_max_good != null ? Number(o.cuda_max_good) : 0;
     if (cuda < minCuda) return false;
+    if (o.machine_id != null && blockedSet) {
+      const midNum = Number(o.machine_id);
+      const midStr = String(o.machine_id);
+      if (blockedSet.has(midNum) || (blockedSet as ReadonlySet<unknown>).has(midStr)) {
+        return false;
+      }
+    }
     return true;
   });
 

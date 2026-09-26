@@ -14,10 +14,24 @@ import {
   classifyBackendDevice,
   fetchInstanceLogs,
   CpuBackendError,
+  UnknownBackendError,
+  isBackendVerified,
+  assertBackendVerified,
+  PRE_CONTAINER_START_DEADLINE_MS,
+  POST_CONTAINER_HEALTH_DEADLINE_MS,
   type BackendDevice,
 } from "../instances/status.js";
 
-export { CpuBackendError, classifyBackendDevice, type BackendDevice };
+export {
+  CpuBackendError,
+  UnknownBackendError,
+  classifyBackendDevice,
+  isBackendVerified,
+  assertBackendVerified,
+  PRE_CONTAINER_START_DEADLINE_MS,
+  POST_CONTAINER_HEALTH_DEADLINE_MS,
+  type BackendDevice,
+};
 
 export class EmbeddingDimensionMismatchError extends Error {
   readonly expected: number;
@@ -172,3 +186,89 @@ export async function verifyProvisioning(
     warning: backendResult.warning,
   };
 }
+
+export interface WaitForHealthOptions {
+  readonly timeoutMs?: number;
+  readonly pollIntervalMs?: number;
+  readonly fetch?: typeof fetch;
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly now?: () => number;
+  readonly healthPath?: string;
+  readonly checkBackendEarly?: boolean;
+  readonly instanceId?: number;
+  readonly fetchLogs?: (instanceId: number) => Promise<string>;
+  readonly onDeviceChecked?: (device: BackendDevice) => void;
+  readonly onWarning?: (warning: string) => void;
+}
+
+export interface WaitForHealthResult {
+  readonly healthy: boolean;
+  readonly elapsedMs: number;
+  readonly device?: BackendDevice;
+}
+
+/**
+ * Wait for endpoint /health to return HTTP 200.
+ * Default timeout is POST_CONTAINER_HEALTH_DEADLINE_MS (12 minutes), separate from
+ * the pre-container deadline (pull+start).
+ * If checkBackendEarly is enabled, checks container logs while waiting to reject CPU fallback early.
+ */
+export async function waitForEndpointHealth(
+  baseUrl: string,
+  options?: WaitForHealthOptions,
+): Promise<WaitForHealthResult> {
+  const timeoutMs = options?.timeoutMs ?? POST_CONTAINER_HEALTH_DEADLINE_MS;
+  const pollIntervalMs = options?.pollIntervalMs ?? 15_000;
+  const fetchImpl = options?.fetch ?? globalThis.fetch;
+  const sleep = options?.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const now = options?.now ?? (() => Date.now());
+  const healthPath = options?.healthPath ?? "/health";
+  const url = `${baseUrl.replace(/\/+$/, "")}${healthPath}`;
+
+  const startMs = now();
+  let deviceChecked = false;
+  let detectedDevice: BackendDevice | undefined;
+
+  while (now() - startMs < timeoutMs) {
+    // Check backend device early while waiting for model load
+    if (options?.checkBackendEarly && !deviceChecked && options.instanceId && options.fetchLogs) {
+      try {
+        const logs = await options.fetchLogs(options.instanceId);
+        detectedDevice = classifyBackendDevice(logs);
+        options.onDeviceChecked?.(detectedDevice);
+        if (detectedDevice === "cpu") {
+          throw new CpuBackendError(
+            options.instanceId,
+            "Early log check detected silent CPU fallback",
+          );
+        }
+        if (detectedDevice === "cuda") {
+          deviceChecked = true;
+        }
+      } catch (err) {
+        if (err instanceof CpuBackendError) {
+          throw err;
+        }
+        // Transient log fetch error: continue polling
+      }
+    }
+
+    try {
+      const res = await fetchImpl(url);
+      if (res.status === 200) {
+        return {
+          healthy: true,
+          elapsedMs: now() - startMs,
+          device: detectedDevice,
+        };
+      }
+    } catch {
+      // Endpoint not up yet
+    }
+
+    await sleep(pollIntervalMs);
+  }
+
+  throw new Error(`Endpoint ${baseUrl} did not report healthy within ${timeoutMs}ms`);
+}
+
