@@ -14,6 +14,8 @@
 import { SPEND_LIMITS } from "../limits.js";
 import { getWorkload, type WorkloadId, type WorkloadSpec } from "../workloads.js";
 
+export const DEFAULT_MIN_CUDA = 12.8;
+
 export interface VastOffer {
   readonly id: number;
   readonly gpu_name?: string;
@@ -26,6 +28,7 @@ export interface VastOffer {
   readonly inet_down?: number;
   readonly storage_cost?: number;
   readonly geolocation?: string;
+  readonly cuda_max_good?: number | string | null;
   readonly [key: string]: unknown;
 }
 
@@ -34,6 +37,8 @@ export interface SelectOffersOptions {
   readonly excludeGeo?: readonly string[];
   /** Maximum hourly price in USD. Default: SPEND_LIMITS.maxDphTotal. */
   readonly maxDphTotal?: number;
+  /** Minimum CUDA version required (from cuda_max_good). Default: DEFAULT_MIN_CUDA (12.8). */
+  readonly minCuda?: number;
 }
 
 export class NoEligibleOffersError extends Error {
@@ -44,6 +49,7 @@ export class NoEligibleOffersError extends Error {
     super(
       `No eligible offers found for workload "${workload.id}": ` +
         `required >=${workload.minGpuRamMb}MB VRAM, >=${workload.minDiskGb}GB disk, ` +
+        `>=CUDA ${DEFAULT_MIN_CUDA}, ` +
         `<=$${SPEND_LIMITS.maxDphTotal}/hr (evaluated ${totalOffersConsidered} offers)`,
     );
     this.name = "NoEligibleOffersError";
@@ -73,7 +79,8 @@ export function isGeoExcluded(
 
 /**
  * Filter and rank offers for a workload. Returns a list of all qualifying candidates
- * ordered by reliability2 desc, dph_total asc, inet_down desc.
+ * ordered by verified inet_down (> 0 before unmeasured), reliability2 desc,
+ * dph_total asc, inet_down desc.
  * Throws NoEligibleOffersError if none qualify.
  */
 export function selectCandidateOffers(
@@ -84,6 +91,7 @@ export function selectCandidateOffers(
   const spec = typeof workload === "string" ? getWorkload(workload) : workload;
   const maxDph = options?.maxDphTotal ?? SPEND_LIMITS.maxDphTotal;
   const excludeGeo = options?.excludeGeo ?? ["CN"];
+  const minCuda = options?.minCuda !== undefined ? options.minCuda : DEFAULT_MIN_CUDA;
 
   const eligible = offers.filter((o) => {
     if (!o.rentable) return false;
@@ -91,6 +99,8 @@ export function selectCandidateOffers(
     if (o.disk_space < spec.minDiskGb) return false;
     if (o.dph_total > maxDph) return false;
     if (isGeoExcluded(o.geolocation, excludeGeo)) return false;
+    const cuda = o.cuda_max_good != null ? Number(o.cuda_max_good) : 0;
+    if (cuda < minCuda) return false;
     return true;
   });
 
@@ -98,8 +108,15 @@ export function selectCandidateOffers(
     throw new NoEligibleOffersError(spec, offers.length);
   }
 
-  // Sort: prefer higher reliability2, then lower dph_total, then higher inet_down
+  // Sort: prefer verified bandwidth (>0) over unmeasured (0/missing),
+  // then higher reliability2, then lower dph_total, then higher inet_down
   return [...eligible].sort((a, b) => {
+    const hasNetA = a.inet_down != null && a.inet_down > 0 ? 1 : 0;
+    const hasNetB = b.inet_down != null && b.inet_down > 0 ? 1 : 0;
+    if (hasNetA !== hasNetB) {
+      return hasNetB - hasNetA; // verified first, 0/missing last resort
+    }
+
     const relA = a.reliability2 ?? 0;
     const relB = b.reliability2 ?? 0;
     if (relA !== relB) {

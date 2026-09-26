@@ -4,6 +4,7 @@ import {
   selectCandidateOffers,
   isGeoExcluded,
   NoEligibleOffersError,
+  DEFAULT_MIN_CUDA,
   type VastOffer,
 } from "../src/offers/select.js";
 import { EMBEDDING_WORKLOAD, QWEN_WORKLOAD } from "../src/workloads.js";
@@ -19,6 +20,7 @@ describe("selectOffer", () => {
     rentable: true,
     reliability2: 0.95,
     inet_down: 500,
+    cuda_max_good: 13.0,
   };
 
   it("selects a valid offer meeting all requirements", () => {
@@ -238,6 +240,116 @@ describe("selectOffer", () => {
     expect(isGeoExcluded(undefined)).toBe(false);
     expect(isGeoExcluded(null)).toBe(false);
     expect(isGeoExcluded("CN", [])).toBe(false);
+  });
+
+  describe("minimum CUDA gate (minCuda, default 12.8)", () => {
+    it("rejects offer with cuda_max_good: 12.2 and accepts offer with cuda_max_good: 13.0", () => {
+      const failingBox: VastOffer = {
+        ...baseOffer,
+        id: 701,
+        cuda_max_good: 12.2, // failing live box (driver 535.113.01)
+      };
+      const passingBox: VastOffer = {
+        ...baseOffer,
+        id: 702,
+        cuda_max_good: 13.0,
+      };
+
+      // When only 12.2 offer is available, selectOffer throws NoEligibleOffersError
+      expect(() => selectOffer(EMBEDDING_WORKLOAD, [failingBox])).toThrow(
+        NoEligibleOffersError,
+      );
+
+      // When 13.0 offer is available, selectOffer accepts it
+      const selected = selectOffer(EMBEDDING_WORKLOAD, [failingBox, passingBox]);
+      expect(selected.id).toBe(702);
+    });
+
+    it("allows configuring minCuda via SelectOffersOptions", () => {
+      const box122: VastOffer = {
+        ...baseOffer,
+        id: 703,
+        cuda_max_good: 12.2,
+      };
+
+      // With default (12.8), rejects 12.2
+      expect(() => selectOffer(EMBEDDING_WORKLOAD, [box122])).toThrow(NoEligibleOffersError);
+
+      // With custom minCuda: 12.0, accepts 12.2
+      const selected = selectOffer(EMBEDDING_WORKLOAD, [box122], { minCuda: 12.0 });
+      expect(selected.id).toBe(703);
+    });
+
+    it("rejects offers missing cuda_max_good", () => {
+      const noCudaOffer: VastOffer = {
+        ...baseOffer,
+        id: 704,
+        cuda_max_good: undefined,
+      };
+      expect(() => selectOffer(EMBEDDING_WORKLOAD, [noCudaOffer])).toThrow(
+        NoEligibleOffersError,
+      );
+    });
+  });
+
+  describe("bandwidth ranking (inet_down: 0 as last resort)", () => {
+    it("never prefers a box with inet_down: 0 over a box with measured bandwidth", () => {
+      const boxWithZeroNet: VastOffer = {
+        ...baseOffer,
+        id: 801,
+        reliability2: 0.99, // higher reliability
+        dph_total: 0.10,     // lower price
+        inet_down: 0,        // unmeasured / broken network
+      };
+
+      const boxWithMeasuredNet: VastOffer = {
+        ...baseOffer,
+        id: 802,
+        reliability2: 0.95, // lower reliability
+        dph_total: 0.20,     // higher price
+        inet_down: 500,      // verified download speed
+      };
+
+      const selected = selectOffer(EMBEDDING_WORKLOAD, [boxWithZeroNet, boxWithMeasuredNet]);
+      expect(selected.id).toBe(802);
+
+      const candidates = selectCandidateOffers(EMBEDDING_WORKLOAD, [
+        boxWithZeroNet,
+        boxWithMeasuredNet,
+      ]);
+      expect(candidates[0]?.id).toBe(802);
+      expect(candidates[1]?.id).toBe(801);
+    });
+
+    it("accepts a box with inet_down: 0 as last resort when it is the only candidate", () => {
+      const onlyBox: VastOffer = {
+        ...baseOffer,
+        id: 803,
+        inet_down: 0,
+      };
+
+      const selected = selectOffer(EMBEDDING_WORKLOAD, [onlyBox]);
+      expect(selected.id).toBe(803);
+    });
+
+    it("treats missing / undefined inet_down as last resort alongside 0", () => {
+      const missingNetBox: VastOffer = {
+        ...baseOffer,
+        id: 804,
+        inet_down: undefined,
+        reliability2: 0.99,
+      };
+
+      const measuredNetBox: VastOffer = {
+        ...baseOffer,
+        id: 805,
+        inet_down: 100,
+        reliability2: 0.95,
+      };
+
+      const selected = selectOffer(EMBEDDING_WORKLOAD, [missingNetBox, measuredNetBox]);
+      expect(selected.id).toBe(805);
+    });
   });
 });
 
