@@ -104,6 +104,50 @@ describe("reapOrphans (src/instances/reap.ts)", () => {
     expect(audit502?.costUsd).toBeCloseTo(0.15, 2);
   });
 
+  it("handles price drift in reaper: calculates audit cost from live instance dph_total, not lease offer price", async () => {
+    const nowMs = 1700000000000;
+
+    // Search offer price was $0.1489/hr
+    const declaredLease: Lease = {
+      label: `${ourPrefix}--embedding--drift-test--${nowMs - 3600_000}`,
+      workload: "embedding",
+      offerId: 10,
+      dphTotal: 0.1489,
+      createdAtMs: nowMs - 3600_000,
+      expiresAtMs: nowMs - 60_000, // expired
+      owner: "test",
+      instanceId: 777,
+    };
+
+    // Live instance reports drifted dph_total of $0.1578
+    const live = [
+      {
+        id: 777,
+        label: declaredLease.label,
+        actual_status: "running",
+        dph_total: 0.1578,
+      },
+    ];
+
+    const mockClient = {
+      get: vi.fn().mockResolvedValue({ instances: live }),
+    } as unknown as VastClient;
+
+    const auditEntries: Array<{ instanceId: number; costUsd: number }> = [];
+
+    await reapOrphans({
+      client: mockClient,
+      listLeasesFn: async () => [declaredLease],
+      destroyFn: vi.fn().mockResolvedValue({ instanceId: 777, destroyed: true, polls: 2, durationMs: 10 }),
+      auditLogger: (entry) => auditEntries.push(entry),
+      nowMs,
+    });
+
+    expect(auditEntries).toHaveLength(1);
+    // Cost must be 1 hour * $0.1578 = ~$0.1578, NOT $0.1489!
+    expect(auditEntries[0]?.costUsd).toBeCloseTo(0.1578, 4);
+  });
+
   it("is bounded: destroys at most 3 instances per run", async () => {
     const nowMs = 1700000000000;
     // 5 orphaned instances

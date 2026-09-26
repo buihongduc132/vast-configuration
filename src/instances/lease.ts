@@ -88,14 +88,50 @@ export function isExpired(lease: LeaseIntent, nowMs: number = Date.now()): boole
   return nowMs >= lease.expiresAtMs;
 }
 
-/** Cost accrued so far, from wall-clock lifetime — computable immediately and
- *  deterministically, unlike the account balance which lags behind. */
+export interface LiveInstanceCostSource {
+  readonly dph_total?: number | null;
+  readonly start_date?: number | null;
+  readonly createdAtMs?: number;
+  readonly dphTotal?: number;
+  readonly [key: string]: unknown;
+}
+
+/**
+ * Cost accrued so far, from wall-clock lifetime — computable immediately and
+ * deterministically, unlike the account balance which lags behind.
+ *
+ * ⚠️ PRICE DRIFT (verified live 2026-09-27):
+ * The price quoted at search time is NOT what you are billed. Search said
+ * $0.1489/hr; the live instance reported dph_total $0.1578; a third reported
+ * $0.1711. Any cost estimate must read `dph_total` from the INSTANCE object,
+ * not from the offer. If a liveInstance is provided, its `dph_total` overrides
+ * any offer-time `dphTotal` on the lease.
+ */
 export function accruedCostUsd(
-  lease: LeaseIntent,
+  leaseOrInstance: LeaseIntent | LiveInstanceCostSource,
   nowMs: number = Date.now(),
+  liveInstance?: LiveInstanceCostSource | null,
 ): number {
-  const hours = Math.max(0, nowMs - lease.createdAtMs) / 3_600_000;
-  return hours * lease.dphTotal;
+  let dph = 0;
+  if (liveInstance && liveInstance.dph_total !== undefined && liveInstance.dph_total !== null) {
+    dph = Number(liveInstance.dph_total);
+  } else if ("dph_total" in leaseOrInstance && leaseOrInstance.dph_total !== undefined && leaseOrInstance.dph_total !== null) {
+    dph = Number(leaseOrInstance.dph_total);
+  } else if ("dphTotal" in leaseOrInstance && leaseOrInstance.dphTotal !== undefined) {
+    dph = Number(leaseOrInstance.dphTotal);
+  }
+
+  let startMs = nowMs;
+  if ("createdAtMs" in leaseOrInstance && typeof leaseOrInstance.createdAtMs === "number") {
+    startMs = leaseOrInstance.createdAtMs;
+  } else if ("start_date" in leaseOrInstance && typeof leaseOrInstance.start_date === "number") {
+    startMs = leaseOrInstance.start_date * 1000;
+  } else if (liveInstance && typeof liveInstance.start_date === "number") {
+    startMs = liveInstance.start_date * 1000;
+  }
+
+  const hours = Math.max(0, nowMs - startMs) / 3_600_000;
+  return hours * dph;
 }
 
 export interface ReapDecision {

@@ -14,8 +14,8 @@ import { VastClient } from "../src/api/client.js";
 import { WORKLOADS, getWorkload, type WorkloadId } from "../src/workloads.js";
 import { SPEND_LIMITS } from "../src/limits.js";
 import { accruedCostUsd, isOurLabel } from "../src/instances/lease.js";
-import { selectOffer, type VastOffer } from "../src/offers/select.js";
-import { rentInstance, RENT_CONFIRM_TOKEN } from "../src/instances/rent.js";
+import { selectOffer, selectCandidateOffers, type VastOffer } from "../src/offers/select.js";
+import { rentInstance, rentFirstAvailable, RENT_CONFIRM_TOKEN } from "../src/instances/rent.js";
 import { destroyInstance } from "../src/instances/destroy.js";
 import { reapOrphans } from "../src/instances/reap.js";
 
@@ -75,18 +75,7 @@ async function cmdInstances(): Promise<void> {
     const label = (i.label as string | null) ?? null;
     const mine = isOurLabel(label) ? "ours" : "FOREIGN (never auto-destroy)";
     const cost = startMs
-      ? accruedCostUsd(
-          {
-            label: label ?? "",
-            workload: "?",
-            offerId: 0,
-            dphTotal: dph,
-            createdAtMs: startMs,
-            expiresAtMs: Number.MAX_SAFE_INTEGER,
-            owner: "?",
-          },
-          Date.now(),
-        )
+      ? accruedCostUsd(i, Date.now())
       : 0;
     console.log(
       `${i.id}  ${String(i.gpu_name)}  $${dph.toFixed(4)}/hr  util ${i.gpu_util ?? "?"}%  ` +
@@ -111,12 +100,13 @@ async function cmdOffers(workloadId: string): Promise<void> {
       type: "on-demand",
     },
   });
-  const offers = (r.offers ?? []).filter(
-    (o) =>
-      Number(o.gpu_ram ?? 0) >= w.minGpuRamMb &&
-      Number(o.disk_space ?? 0) >= w.minDiskGb &&
-      Number(o.dph_total ?? Infinity) <= SPEND_LIMITS.maxDphTotal,
-  );
+  const rawOffers = (r.offers ?? []) as unknown as VastOffer[];
+  let offers: VastOffer[] = [];
+  try {
+    offers = selectCandidateOffers(w, rawOffers);
+  } catch {
+    offers = [];
+  }
   console.log(
     `workload ${w.id}: needs >=${(w.minGpuRamMb / 1024).toFixed(0)}GiB VRAM, ` +
       `>=${w.minDiskGb}GiB disk, <=$${SPEND_LIMITS.maxDphTotal}/hr\n`,
@@ -185,16 +175,16 @@ async function cmdRent(workloadArg?: string): Promise<void> {
   });
 
   const rawOffers = (r.offers ?? []) as unknown as VastOffer[];
-  const selectedOffer = selectOffer(workload, rawOffers);
+  const candidates = selectCandidateOffers(workload, rawOffers);
 
   console.log(
-    `Selected offer ${selectedOffer.id} ($${selectedOffer.dph_total.toFixed(4)}/hr, ` +
-      `rel ${selectedOffer.reliability2 ?? "?"}). Renting...`,
+    `Found ${candidates.length} candidate offer(s) (top: ${candidates[0]?.id}, ` +
+      `$${candidates[0]?.dph_total.toFixed(4)}/hr, rel ${candidates[0]?.reliability2 ?? "?"}). Renting...`,
   );
 
-  const res = await rentInstance({
+  const res = await rentFirstAvailable({
     workload,
-    offer: selectedOffer,
+    candidates,
     client,
   });
 

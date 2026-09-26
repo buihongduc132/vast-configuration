@@ -120,22 +120,9 @@ export async function reapOrphans(options?: ReapOptions): Promise<ReapResult> {
     const lease = declaredByInstanceId.get(decision.instanceId);
     let costUsd = 0;
     if (lease) {
-      costUsd = accruedCostUsd(lease, nowMs);
+      costUsd = accruedCostUsd(lease, nowMs, liveInst);
     } else if (liveInst.start_date && liveInst.dph_total) {
-      const startMs = Number(liveInst.start_date) * 1000;
-      const dph = Number(liveInst.dph_total);
-      costUsd = accruedCostUsd(
-        {
-          label: liveInst.label ?? "",
-          workload: "?",
-          offerId: 0,
-          dphTotal: dph,
-          createdAtMs: startMs,
-          expiresAtMs: Number.MAX_SAFE_INTEGER,
-          owner: "?",
-        },
-        nowMs,
-      );
+      costUsd = accruedCostUsd(liveInst, nowMs);
     }
 
     // Execute teardown

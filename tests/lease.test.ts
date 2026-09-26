@@ -87,6 +87,28 @@ describe("expiry + cost", () => {
     expect(accruedCostUsd(l, T0 + 1_800_000)).toBeCloseTo(0.06, 6);
   });
 
+  it("handles price drift: reads dph_total from INSTANCE object, not from offer search", () => {
+    // Search said $0.1489/hr; live instance reported $0.1578
+    const l = lease({ dphTotal: 0.1489 });
+    const liveInstance = { dph_total: 0.1578 };
+
+    // With live instance provided, 1 hour cost must be $0.1578, NOT $0.1489
+    const cost = accruedCostUsd(l, T0 + 3_600_000, liveInstance);
+    expect(cost).toBeCloseTo(0.1578, 6);
+
+    // Third box reported $0.1711
+    const liveInstance3 = { dph_total: 0.1711 };
+    expect(accruedCostUsd(l, T0 + 3_600_000, liveInstance3)).toBeCloseTo(0.1711, 6);
+  });
+
+  it("calculates cost directly from live instance object with start_date and dph_total", () => {
+    const liveInstance = {
+      start_date: T0 / 1000,
+      dph_total: 0.1578,
+    };
+    expect(accruedCostUsd(liveInstance, T0 + 3_600_000)).toBeCloseTo(0.1578, 6);
+  });
+
   it("never reports negative cost when clocks go backwards", () => {
     expect(accruedCostUsd(lease(), T0 - 60_000)).toBe(0);
   });
