@@ -50,6 +50,7 @@ Base: `https://console.vast.ai/api/v0/`, auth header `Authorization: Bearer <key
 | **`gpu_name` uses spaces** | `"RTX 3090"` matches; `"RTX_3090"` returns **0 offers with HTTP 200**. A silent-empty result, not an error. |
 | **Wrong endpoints 404** | `POST /search/asks/` → 404. `PUT /bundles/` → 404. Offer search is `GET /bundles/?q=<url-encoded JSON>`. |
 | **Official PyPI CLI is broken here** | `vastai` 1.8.2 fails at import (`requests`/`urllib3` conflict). Do **not** depend on it — the REST API is the dependable surface. |
+| **Silent CPU fallback** | A rented GPU can silently serve on CPU; dimension and health checks cannot detect it; assert the backend device from container logs (`classifyBackendDevice`). |
 
 Query shape for `/bundles/`:
 
