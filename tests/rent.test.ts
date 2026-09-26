@@ -441,5 +441,129 @@ describe("rentFirstAvailable candidate rotation (src/instances/rent.ts)", () => 
     expect(result.instanceId).toBe(4444);
     expect(destroySpy).toHaveBeenCalledWith(3333);
   });
+
+  it("destroys instance and advances to next candidate on terminal state (offline)", async () => {
+    const { rentFirstAvailable } = await import("../src/instances/rent.js");
+
+    const putApiSpy = vi
+      .fn()
+      .mockResolvedValueOnce({ success: true, new_contract: 5555 })
+      .mockResolvedValueOnce({ success: true, new_contract: 6666 });
+
+    const getApiSpy = vi
+      .fn()
+      // Poll 1 for instance 5555: offline -> terminal
+      .mockResolvedValueOnce({
+        instances: [{ id: 5555, actual_status: "offline" }],
+      })
+      // Poll 2 for instance 6666: running
+      .mockResolvedValueOnce({
+        instances: [
+          {
+            id: 6666,
+            actual_status: "running",
+            dph_total: 0.18,
+          },
+        ],
+      });
+
+    const destroySpy = vi.fn().mockResolvedValue(undefined);
+
+    const mockClient = {
+      get: getApiSpy,
+      put: putApiSpy,
+    } as unknown as VastClient;
+
+    const result = await rentFirstAvailable({
+      workload: EMBEDDING_WORKLOAD,
+      candidates: [candidate1, candidate2],
+      creditUsd: 50.0,
+      currentInstanceCount: 0,
+      client: mockClient,
+      putLeaseFn: vi.fn(),
+      deleteLeaseFn: vi.fn(),
+      destroyFn: destroySpy,
+      waitForReady: true,
+      pollIntervalMs: 1,
+      candidateDeadlineMs: 10_000,
+    });
+
+    expect(result.instanceId).toBe(6666);
+    expect(destroySpy).toHaveBeenCalledWith(5555);
+  });
+
+  it("destroys instance and advances to next candidate when verifyBackend detects CPU fallback", async () => {
+    const { rentFirstAvailable } = await import("../src/instances/rent.js");
+
+    // Candidate 1 rents (id: 7777), enters running state, but logs CPU fallback
+    // Candidate 2 rents (id: 8888), enters running state, logs CUDA
+    const putApiSpy = vi
+      .fn()
+      .mockResolvedValueOnce({ success: true, new_contract: 7777 })
+      .mockResolvedValueOnce({ success: true, new_contract: 8888 });
+
+    const getApiSpy = vi
+      .fn()
+      // Poll 1 for instance 7777: running
+      .mockResolvedValueOnce({
+        instances: [{ id: 7777, actual_status: "running" }],
+      })
+      // Poll 2 for instance 8888: running
+      .mockResolvedValueOnce({
+        instances: [
+          {
+            id: 8888,
+            actual_status: "running",
+            dph_total: 0.18,
+          },
+        ],
+      });
+
+    const destroySpy = vi.fn().mockResolvedValue(undefined);
+
+    const cpuLog = `
+WARN text_embeddings_backend_candle: Could not find a compatible CUDA device on host: CUDA is not available
+Caused by:
+    DriverError(CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE, "forward compatibility was attempted on non supported HW")
+WARN text_embeddings_backend_candle: Using CPU instead
+INFO text_embeddings_backend_candle: Starting Qwen3 model on Cpu
+`;
+    const cudaLog = `
+INFO text_embeddings_backend_candle: Starting Qwen3 model on Cuda
+`;
+
+    const fetchLogsSpy = vi.fn().mockImplementation(async (id: number) => {
+      if (id === 7777) return cpuLog;
+      return cudaLog;
+    });
+
+    const mockClient = {
+      get: getApiSpy,
+      put: putApiSpy,
+    } as unknown as VastClient;
+
+    const result = await rentFirstAvailable({
+      workload: EMBEDDING_WORKLOAD,
+      candidates: [candidate1, candidate2],
+      creditUsd: 50.0,
+      currentInstanceCount: 0,
+      client: mockClient,
+      putLeaseFn: vi.fn(),
+      deleteLeaseFn: vi.fn(),
+      destroyFn: destroySpy,
+      waitForReady: true,
+      verifyBackend: true,
+      fetchLogsFn: fetchLogsSpy,
+      pollIntervalMs: 1,
+      candidateDeadlineMs: 10_000,
+    });
+
+    expect(result.instanceId).toBe(8888);
+    // Destroyed instance 7777 on CPU fallback host failure
+    expect(destroySpy).toHaveBeenCalledWith(7777);
+    expect(putApiSpy).toHaveBeenCalledTimes(2);
+    expect(fetchLogsSpy).toHaveBeenCalledWith(7777);
+    expect(fetchLogsSpy).toHaveBeenCalledWith(8888);
+  });
 });
 

@@ -9,6 +9,15 @@
 // =============================================================================
 
 import { EMBEDDING_DIMENSION } from "../workloads.js";
+import { VastClient } from "../api/client.js";
+import {
+  classifyBackendDevice,
+  fetchInstanceLogs,
+  CpuBackendError,
+  type BackendDevice,
+} from "../instances/status.js";
+
+export { CpuBackendError, classifyBackendDevice, type BackendDevice };
 
 export class EmbeddingDimensionMismatchError extends Error {
   readonly expected: number;
@@ -86,4 +95,80 @@ export async function probeEmbedding(
   }
 
   return vector as number[];
+}
+
+export interface VerifyBackendOptions {
+  readonly client?: VastClient;
+  readonly fetchLogs?: (instanceId: number) => Promise<string>;
+  readonly logText?: string;
+  readonly onWarning?: (warning: string) => void;
+}
+
+export interface VerifyBackendResult {
+  readonly device: "cuda" | "unknown";
+  readonly warning?: string;
+}
+
+/**
+ * Verify backend compute device from container logs.
+ * Throws CpuBackendError (a FatalHostError) if the model is running on CPU.
+ * Surfaces an explicit warning for "unknown" (never assumes CUDA).
+ */
+export async function verifyBackendDevice(
+  instanceId: number,
+  options?: VerifyBackendOptions,
+): Promise<VerifyBackendResult> {
+  const logText =
+    options?.logText ??
+    (options?.fetchLogs
+      ? await options.fetchLogs(instanceId)
+      : await fetchInstanceLogs(instanceId, { client: options?.client }));
+
+  const device = classifyBackendDevice(logText);
+
+  if (device === "cpu") {
+    throw new CpuBackendError(instanceId, "Container logs indicate CPU backend fallback");
+  }
+
+  if (device === "unknown") {
+    const warning = `Instance ${instanceId}: could not determine backend device from container logs — recorded as UNVERIFIED`;
+    options?.onWarning?.(warning);
+    return { device: "unknown", warning };
+  }
+
+  return { device: "cuda" };
+}
+
+export interface VerifyProvisionOptions extends ProbeOptions, VerifyBackendOptions {
+  readonly probeBaseUrl?: string;
+}
+
+export interface ProvisionVerificationResult {
+  readonly dimension?: number;
+  readonly backend: "cuda" | "unknown";
+  readonly warning?: string;
+}
+
+/**
+ * Complete provision verification:
+ * 1. Verifies backend device from container logs (rejects CPU fallback)
+ * 2. Probes embedding endpoint if probeBaseUrl is supplied (asserts 1024-dim per EMB-001)
+ */
+export async function verifyProvisioning(
+  instanceId: number,
+  options?: VerifyProvisionOptions,
+): Promise<ProvisionVerificationResult> {
+  const backendResult = await verifyBackendDevice(instanceId, options);
+
+  let dimension: number | undefined;
+  if (options?.probeBaseUrl) {
+    const vector = await probeEmbedding(options.probeBaseUrl, options);
+    dimension = vector.length;
+  }
+
+  return {
+    dimension,
+    backend: backendResult.device,
+    warning: backendResult.warning,
+  };
 }

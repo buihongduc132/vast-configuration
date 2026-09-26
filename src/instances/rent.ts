@@ -30,6 +30,7 @@ import {
   FatalHostError,
   TerminalInstanceStateError,
 } from "./status.js";
+import { verifyBackendDevice } from "../provision/verify.js";
 
 /** Token the operator must set in VAST_LIVE_CONFIRM to authorize renting real GPUs. */
 export const RENT_CONFIRM_TOKEN = "i-accept-gpu-rental-charges";
@@ -259,6 +260,9 @@ export interface RentCandidatesArgs {
   readonly rentInstanceFn?: (args: RentInstanceArgs) => Promise<RentResult>;
   readonly destroyFn?: (instanceId: number) => Promise<unknown>;
   readonly waitForReady?: boolean;
+  readonly verifyBackend?: boolean;
+  readonly fetchLogsFn?: (instanceId: number) => Promise<string>;
+  readonly onWarning?: (warning: string) => void;
   readonly candidateDeadlineMs?: number;
   readonly pollIntervalMs?: number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -330,6 +334,15 @@ export async function rentFirstAvailable(args: RentCandidatesArgs): Promise<Rent
           sleep,
           now,
         });
+
+        // Backend device assertion: CPU fallback must be treated as fatal-host failure
+        if (args.verifyBackend) {
+          await verifyBackendDevice(rentResult.instanceId, {
+            client,
+            fetchLogs: args.fetchLogsFn,
+            onWarning: args.onWarning,
+          });
+        }
 
         // Live instance price update (price drift)
         const actualDph =
