@@ -35,8 +35,12 @@ export interface VastOffer {
 export interface SelectOffersOptions {
   /** Country / region codes to exclude from candidate selection. Default: ["CN"]. */
   readonly excludeGeo?: readonly string[];
-  /** Maximum hourly price in USD. Default: SPEND_LIMITS.maxDphTotal. */
-  readonly maxDphTotal?: number;
+  /**
+   * Hourly price ceiling in USD, per instance. STRICTLY under: an offer at
+   * exactly this price is filtered out (VAST-SPEND-002).
+   * Default: SPEND_LIMITS.maxDphPerInstance.
+   */
+  readonly maxDphPerInstance?: number;
   /** Minimum CUDA version required (from cuda_max_good). Default: DEFAULT_MIN_CUDA (12.8). */
   readonly minCuda?: number;
 }
@@ -50,7 +54,7 @@ export class NoEligibleOffersError extends Error {
       `No eligible offers found for workload "${workload.id}": ` +
         `required >=${workload.minGpuRamMb}MB VRAM, >=${workload.minDiskGb}GB disk, ` +
         `>=CUDA ${DEFAULT_MIN_CUDA}, ` +
-        `<=$${SPEND_LIMITS.maxDphTotal}/hr (evaluated ${totalOffersConsidered} offers)`,
+        `<$${SPEND_LIMITS.maxDphPerInstance}/hr (evaluated ${totalOffersConsidered} offers)`,
     );
     this.name = "NoEligibleOffersError";
     this.workload = workload;
@@ -89,7 +93,7 @@ export function selectCandidateOffers(
   options?: SelectOffersOptions,
 ): VastOffer[] {
   const spec = typeof workload === "string" ? getWorkload(workload) : workload;
-  const maxDph = options?.maxDphTotal ?? SPEND_LIMITS.maxDphTotal;
+  const maxDph = options?.maxDphPerInstance ?? SPEND_LIMITS.maxDphPerInstance;
   const excludeGeo = options?.excludeGeo ?? ["CN"];
   const minCuda = options?.minCuda !== undefined ? options.minCuda : DEFAULT_MIN_CUDA;
 
@@ -97,7 +101,10 @@ export function selectCandidateOffers(
     if (!o.rentable) return false;
     if (o.gpu_ram < spec.minGpuRamMb) return false;
     if (o.disk_space < spec.minDiskGb) return false;
-    if (o.dph_total > maxDph) return false;
+    // STRICTLY under the cap, matching VAST-SPEND-002. An offer at exactly the
+    // cap is filtered here so it never reaches the OPA gate and gets refused
+    // later — the filter and the gate must agree on the boundary.
+    if (o.dph_total >= maxDph) return false;
     if (isGeoExcluded(o.geolocation, excludeGeo)) return false;
     const cuda = o.cuda_max_good != null ? Number(o.cuda_max_good) : 0;
     if (cuda < minCuda) return false;

@@ -3,7 +3,12 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { SPEND_LIMITS, canRent, maxCostOfRentalUsd } from "../src/limits.js";
+import {
+  SPEND_LIMITS,
+  canRent,
+  maxCostOfRentalUsd,
+  maxConcurrentCostUsd,
+} from "../src/limits.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -30,13 +35,24 @@ describe("spend ceiling is enforced before spending, not after", () => {
   });
 
   it("refuses an offer above the hourly cap", () => {
-    const d = canRent({ ...base, dphTotal: SPEND_LIMITS.maxDphTotal + 0.01 });
+    const d = canRent({ ...base, dphTotal: SPEND_LIMITS.maxDphPerInstance + 0.01 });
     expect(d.allowed).toBe(false);
     if (!d.allowed) expect(d.reason).toContain("cap");
   });
 
-  it("accepts an offer exactly at the cap (boundary is inclusive)", () => {
-    expect(canRent({ ...base, dphTotal: SPEND_LIMITS.maxDphTotal }).allowed).toBe(true);
+  // Boundary is EXCLUSIVE: the operator asked for "< $0.20/hr per box", so
+  // exactly $0.20 is refused. Must match VAST-SPEND-002 in the Rego, which the
+  // parity test in tests/policy-gate.test.ts checks directly.
+  it("refuses an offer exactly at the cap (boundary is exclusive)", () => {
+    const d = canRent({ ...base, dphTotal: SPEND_LIMITS.maxDphPerInstance });
+    expect(d.allowed).toBe(false);
+    if (!d.allowed) expect(d.reason).toContain("strictly under");
+  });
+
+  it("accepts an offer just below the cap", () => {
+    expect(
+      canRent({ ...base, dphTotal: SPEND_LIMITS.maxDphPerInstance - 0.0001 }).allowed,
+    ).toBe(true);
   });
 
   it("refuses a nonsense price rather than treating it as free", () => {
@@ -52,16 +68,28 @@ describe("spend ceiling is enforced before spending, not after", () => {
   });
 
   it("bounds the worst case of a single rental", () => {
-    // 45 min at $0.45/hr — the most one permitted rental can ever cost.
-    expect(maxCostOfRentalUsd(SPEND_LIMITS.maxDphTotal)).toBeCloseTo(0.3375, 4);
+    // 45 min just under $0.20/hr — the most one permitted rental can cost.
+    expect(maxCostOfRentalUsd(SPEND_LIMITS.maxDphPerInstance)).toBeCloseTo(0.15, 4);
     expect(maxCostOfRentalUsd(0.12)).toBeCloseTo(0.09, 4);
   });
 
   it("keeps ceilings low enough that one rental cannot drain the account", () => {
     // Sanity on the constants themselves, not just the logic.
-    expect(maxCostOfRentalUsd(SPEND_LIMITS.maxDphTotal)).toBeLessThan(1);
+    expect(maxCostOfRentalUsd(SPEND_LIMITS.maxDphPerInstance)).toBeLessThan(1);
     expect(SPEND_LIMITS.maxConcurrentInstances).toBeLessThanOrEqual(2);
     expect(SPEND_LIMITS.maxLifetimeMinutes).toBeLessThanOrEqual(120);
+  });
+
+  it("bounds the worst case of a FULL complement of rentals", () => {
+    // Both permitted slots, both at the ceiling, both running the full lifetime.
+    // This is the true maximum exposure of the whole system.
+    expect(maxConcurrentCostUsd()).toBeCloseTo(0.3, 4);
+    expect(maxConcurrentCostUsd()).toBeLessThan(1);
+  });
+
+  it("ships the ceilings the operator asked for: 2 boxes, under $0.20/hr each", () => {
+    expect(SPEND_LIMITS.maxConcurrentInstances).toBe(2);
+    expect(SPEND_LIMITS.maxDphPerInstance).toBe(0.2);
   });
 });
 

@@ -1,0 +1,24 @@
+{
+  "_doc": [
+    "SINGLE SOURCE OF TRUTH for Vast.ai spend ceilings (P14: correlated values defined once).",
+    "Read by exactly two consumers, so the numbers cannot drift:",
+    "  1. policies/rego/vast_spend.rego  — via `opa eval --data policies/data/spend-limits.json`",
+    "  2. src/limits.ts                  — via readFileSync at module load",
+    "A test asserts both readers agree. Change a number HERE and nowhere else.",
+    "NOTE: OPA mounts a --data JSON at the ROOT of `data`, ignoring filename and",
+    "directory. The `vast_spend_limits` wrapper key below IS the mount path:",
+    "data.vast_spend_limits.*  — without it these keys would collide with package names."
+  ],
+  "vast_spend_limits": {
+    "maxConcurrentInstances": 2,
+    "maxDphPerInstance": 0.2,
+    "maxLifetimeMinutes": 45,
+    "minCreditFloorUsd": 5.0,
+    "_semantics": {
+      "maxConcurrentInstances": "At most this many rentals held AT ONCE, counted across the whole account (foreign/unlabelled boxes included — they bill the same card). Renting while already holding this many is denied.",
+      "maxDphPerInstance": "STRICTLY less than. An offer at exactly this price is DENIED. Applies to the Vast.ai `dph_total` field, which is the all-in hourly price of one instance.",
+      "maxLifetimeMinutes": "Reaper destroys a rental older than this regardless of health.",
+      "minCreditFloorUsd": "Refuse to rent when remaining credit is at or below this."
+    }
+  }
+}

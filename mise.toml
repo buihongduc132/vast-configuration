@@ -21,6 +21,14 @@ run = "cd ${VAST_CONFIG_DIR} && npx tsc --noEmit"
 description = "READ-ONLY live API tests (needs credentials, costs $0). Rentals need VAST_LIVE_CONFIRM."
 run = "cd ${VAST_CONFIG_DIR} && VAST_LIVE=1 npx vitest run"
 
+[tasks."vast:test:policy"]
+description = "OPA unit tests for the spend gate (VAST-SPEND-001/002)"
+run = "cd ${VAST_CONFIG_DIR} && opa test policies/rego policies/data"
+
+[tasks."vast:gate"]
+description = "Ask the OPA spend gate about a hypothetical rental: vast:gate <dph> [live-count]"
+run = "${VAST_CONFIG_DIR}/scripts/gate-check.sh"
+
 # ── Inspect (read-only) ─────────────────────────────────────────────────────
 
 [tasks."vast:whoami"]

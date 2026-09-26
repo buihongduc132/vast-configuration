@@ -40,6 +40,54 @@ Therefore:
 2. Live tests must destroy what they rent, and report spend.
 3. Never leave an instance up "to try again later" without recording it.
 
+## 🚦 The spend gate (VAST-SPEND-001 / 002) — operator-set ceilings
+
+| Rule | Ceiling | Boundary |
+|---|---|---|
+| **VAST-SPEND-001** | at most **2** instances at once, counted across the **whole account** | holding 2 → a 3rd is denied |
+| **VAST-SPEND-002** | **strictly under $0.20/hr** per instance | exactly `$0.20` is **denied** |
+
+Foreign/unlabelled instances **count** toward the concurrency cap — they bill the same card.
+(They are still never *destroyed* automatically; counting and destroying are different
+permissions.)
+
+Both numbers live in **`policies/data/spend-limits.json` and nowhere else** (P14). Two readers:
+`policies/rego/vast_spend.rego` via `opa eval --data`, and `src/limits.ts` via `readFileSync`.
+A test asserts the two agree on every boundary, so the fast local check can't drift from the
+authoritative policy.
+
+```bash
+mise run vast:gate 0.15 0     # ALLOW (exit 0)
+mise run vast:gate 0.20 0     # DENY  (exit 1) — at the cap, not under it
+mise run vast:gate 0.15 2     # DENY  (exit 1) — third box
+mise run vast:test:policy     # opa test policies/rego policies/data
+```
+
+`opa` is a **hard dependency**, not optional tooling. `tests/policy-gate.test.ts` fails loudly if
+it is missing rather than skipping — a silently-skipped gate test is indistinguishable from a gate
+that works.
+
+### ⚠️ Two fail-OPEN traps, both found by writing this gate
+
+Full detail in the header of `policies/rego/vast_spend.rego`. Summary, because both are easy to
+reintroduce and neither shows up as a test failure:
+
+1. **Unloaded data document.** `opa eval` exits **0** with an *empty result* when a referenced
+   document is absent. `deny if price > data.<...>.cap` therefore lets **$9.99/hr through with an
+   empty deny set**. Measured. Silence is never approval — the policy denies when the limits
+   document is missing, and `src/policy/gate.ts` re-checks that `limits_seen` came back with real
+   numbers before honouring an `allow`.
+2. **`not is_number(<bare ref>)` does not fire on an ABSENT key.** An unresolvable reference makes
+   the whole rule body undefined, and an undefined body is a rule that *did not match* — not a
+   true `not`. Measured: `dph_total: "0.15"` (wrong type) → caught; `dph_total` **absent** →
+   silently approved. So the obvious type check validates only values that already exist. Use
+   `object.get(input, [...], null)` for input paths and a `default x := false` helper for
+   data-side paths. **Never write `not is_number(<bare ref>)` in a policy in this repo.**
+
+The gate is wired into `rentInstance()` **by default** (not opt-in), before the lease-intent write,
+so a refused rent has no side effects. `tests/rent.test.ts` proves this structurally: neutering the
+call fails 4 tests. Any "gate" that a caller must remember to enable is decoration.
+
 ## ⚠️ API footguns (verified live 2026-09-27 — do not rediscover)
 
 Base: `https://console.vast.ai/api/v0/`, auth header `Authorization: Bearer <key>`.
@@ -125,8 +173,16 @@ vast-configuration/
 │   ├── offers/       ← search + selection (VRAM gate, price cap, reliability)
 │   ├── instances/    ← rent / destroy / list / state reconcile
 │   ├── provision/    ← onstart scripts + image definitions per workload
+│   ├── policy/       ← gate.ts — invokes OPA, fail-closed, verdict or throw
+│   ├── limits.ts     ← reads policies/data/spend-limits.json (no literals here)
 │   └── state/        ← rental state (Consul KV) + drift detection
+├── policies/
+│   ├── data/spend-limits.json      ← ⭐ THE ceilings. Change them here only.
+│   └── rego/vast_spend.rego(+_test) ← VAST-SPEND-001/002, authoritative
 ├── bin/vast.ts       ← CLI entry
+├── scripts/
+│   ├── gate-check.sh         ← ask the gate from a terminal (exit 0/1/2)
+│   └── live-offload-proof.sh ← end-to-end live proof (spends money)
 ├── tests/            ← offline unit tests (fixtures)
 │   └── live/         ← opt-in, costs money, VAST_LIVE=1
 ├── configs/          ← workload definitions (VRAM minimums, images, args)

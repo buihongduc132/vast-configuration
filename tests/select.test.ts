@@ -16,7 +16,10 @@ describe("selectOffer", () => {
     gpu_name: "RTX 3090",
     gpu_ram: 24576, // 24 GiB
     disk_space: 50, // 50 GiB
-    dph_total: 0.2, // $0.20/hr
+    // Must stay STRICTLY under SPEND_LIMITS.maxDphPerInstance ($0.20), or every
+    // test that spreads baseOffer without overriding the price silently becomes
+    // a "filtered by spend cap" test instead of whatever it meant to check.
+    dph_total: 0.12, // $0.12/hr
     rentable: true,
     reliability2: 0.95,
     inet_down: 500,
@@ -55,25 +58,38 @@ describe("selectOffer", () => {
     );
   });
 
-  it("filters out offers exceeding maxDphTotal spend cap", () => {
+  it("filters out offers exceeding the per-instance spend cap", () => {
     const expensive: VastOffer = {
       ...baseOffer,
       id: 104,
-      dph_total: SPEND_LIMITS.maxDphTotal + 0.01,
+      dph_total: SPEND_LIMITS.maxDphPerInstance + 0.01,
     };
     expect(() => selectOffer(EMBEDDING_WORKLOAD, [expensive])).toThrow(
       NoEligibleOffersError,
     );
   });
 
-  it("allows offer exactly at maxDphTotal spend cap (boundary inclusive)", () => {
+  // The filter and the OPA gate must agree on this boundary. If the filter let an
+  // at-cap offer through, it would be rented-attempted and then refused by
+  // VAST-SPEND-002 — wasted round trip, and a confusing failure far from its cause.
+  it("filters out an offer exactly at the cap (boundary exclusive, matches VAST-SPEND-002)", () => {
     const atCap: VastOffer = {
       ...baseOffer,
       id: 105,
-      dph_total: SPEND_LIMITS.maxDphTotal,
+      dph_total: SPEND_LIMITS.maxDphPerInstance,
     };
-    const selected = selectOffer(EMBEDDING_WORKLOAD, [atCap]);
-    expect(selected.id).toBe(105);
+    expect(() => selectOffer(EMBEDDING_WORKLOAD, [atCap])).toThrow(
+      NoEligibleOffersError,
+    );
+  });
+
+  it("keeps an offer just below the cap", () => {
+    const justUnder: VastOffer = {
+      ...baseOffer,
+      id: 106,
+      dph_total: SPEND_LIMITS.maxDphPerInstance - 0.0001,
+    };
+    expect(selectOffer(EMBEDDING_WORKLOAD, [justUnder]).id).toBe(106);
   });
 
   it("filters out offers where rentable is false", () => {
@@ -91,13 +107,13 @@ describe("selectOffer", () => {
     const cheapUnreliable: VastOffer = {
       ...baseOffer,
       id: 201,
-      dph_total: 0.10,
+      dph_total: 0.08,
       reliability2: 0.85,
     };
     const expensiveReliable: VastOffer = {
       ...baseOffer,
       id: 202,
-      dph_total: 0.25,
+      dph_total: 0.18, // dearer, but still under the $0.20 cap
       reliability2: 0.98,
     };
 
@@ -109,7 +125,7 @@ describe("selectOffer", () => {
     const offerA: VastOffer = {
       ...baseOffer,
       id: 301,
-      dph_total: 0.20,
+      dph_total: 0.18,
       reliability2: 0.95,
       inet_down: 100,
     };
@@ -195,14 +211,14 @@ describe("selectOffer", () => {
       ...baseOffer,
       id: 601,
       reliability2: 0.90,
-      dph_total: 0.20,
+      dph_total: 0.18,
       geolocation: "US",
     };
     const offer2: VastOffer = {
       ...baseOffer,
       id: 602,
       reliability2: 0.98,
-      dph_total: 0.30,
+      dph_total: 0.19,
       geolocation: "DE",
     };
     const offer3: VastOffer = {
@@ -298,7 +314,7 @@ describe("selectOffer", () => {
         ...baseOffer,
         id: 801,
         reliability2: 0.99, // higher reliability
-        dph_total: 0.10,     // lower price
+        dph_total: 0.08,     // lower price
         inet_down: 0,        // unmeasured / broken network
       };
 
@@ -306,7 +322,7 @@ describe("selectOffer", () => {
         ...baseOffer,
         id: 802,
         reliability2: 0.95, // lower reliability
-        dph_total: 0.20,     // higher price
+        dph_total: 0.18,     // higher price, still under the $0.20 cap
         inet_down: 500,      // verified download speed
       };
 

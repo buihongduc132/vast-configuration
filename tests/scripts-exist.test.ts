@@ -61,3 +61,61 @@ describe("setup files referenced by vitest config are tracked", () => {
     expect(trackedFiles().has("src/testing/no-network.ts")).toBe(true);
   });
 });
+
+// =============================================================================
+// mise tasks were NOT covered by the check above, and they have exactly the same
+// failure mode: `mise run vast:gate` invoking an untracked script gives a fresh
+// clone an instant non-zero exit. Same gate, second entry point.
+// =============================================================================
+describe("every mise task target is tracked in git", () => {
+  const miseToml = readFileSync(resolve(repoRoot, "mise.toml"), "utf8");
+  const tracked = trackedFiles();
+
+  // Paths a task shells out to, e.g. ${VAST_CONFIG_DIR}/scripts/gate-check.sh
+  const referenced = [
+    ...miseToml.matchAll(/(?:\$\{VAST_CONFIG_DIR\}\/|\.\/)?((?:scripts|bin|src|tests)\/[\w./-]+\.(?:sh|ts|js|py))/g),
+  ].map((m) => m[1]!);
+
+  it("finds task file references to check", () => {
+    expect(referenced.length).toBeGreaterThan(0);
+  });
+
+  for (const target of [...new Set(referenced)]) {
+    it(`mise task target ${target} is tracked in git`, () => {
+      expect(
+        tracked.has(target),
+        `${target} is referenced by a mise task but is NOT tracked in git`,
+      ).toBe(true);
+    });
+  }
+});
+
+// =============================================================================
+// The OPA gate resolves its policy and data by PATH at runtime. If either were
+// untracked, a fresh clone would deny every rental with a confusing
+// "did not evaluate" error — fail-closed, so not a money leak, but a broken
+// repo that looks like a policy problem.
+// =============================================================================
+describe("policy files the gate loads at runtime are tracked in git", () => {
+  const tracked = trackedFiles();
+
+  for (const p of [
+    "policies/rego/vast_spend.rego",
+    "policies/rego/vast_spend_test.rego",
+    "policies/data/spend-limits.json",
+    "scripts/gate-check.sh",
+  ]) {
+    it(`${p} is tracked`, () => {
+      expect(tracked.has(p), `${p} must be committed — the gate loads it by path`).toBe(true);
+    });
+  }
+
+  it("the limits file is the ONLY place the ceilings are written", () => {
+    // Guards P14: a second literal copy of the ceiling is a split-brain waiting
+    // to drift. src/limits.ts must read the JSON, never restate the numbers.
+    const limitsTs = readFileSync(resolve(repoRoot, "src/limits.ts"), "utf8");
+    expect(limitsTs).not.toMatch(/maxDphPerInstance\s*[:=]\s*0?\.\d/);
+    expect(limitsTs).not.toMatch(/maxConcurrentInstances\s*[:=]\s*\d/);
+    expect(limitsTs).toContain("spend-limits.json");
+  });
+});

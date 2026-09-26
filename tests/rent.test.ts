@@ -1,9 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   rentInstance,
   VastRentRefusalError,
   RENT_CONFIRM_TOKEN,
 } from "../src/instances/rent.js";
+import { PolicyGateError, type GateInput } from "../src/policy/gate.js";
 import { EMBEDDING_WORKLOAD } from "../src/workloads.js";
 import { type VastOffer } from "../src/offers/select.js";
 import { VastClient } from "../src/api/client.js";
@@ -564,6 +565,166 @@ INFO text_embeddings_backend_candle: Starting Qwen3 model on Cuda
     expect(putApiSpy).toHaveBeenCalledTimes(2);
     expect(fetchLogsSpy).toHaveBeenCalledWith(7777);
     expect(fetchLogsSpy).toHaveBeenCalledWith(8888);
+  });
+});
+
+// =============================================================================
+// The OPA gate is wired into the rent path BY DEFAULT.
+//
+// These tests exist because every other test in this file supplies its own
+// stubs. If the `assertGate(...)` call in rentInstance were deleted, every one of
+// them would still pass — the suite would be green and the operator's ceiling
+// would be unenforced. These fail if the call goes away.
+// =============================================================================
+describe("the OPA spend gate is on by default, not opt-in", () => {
+  const cheapOffer: VastOffer = {
+    id: 987,
+    gpu_name: "RTX 3090",
+    gpu_ram: 24576,
+    disk_space: 50,
+    dph_total: 0.12, // passes canRent, so only the OPA gate can stop it
+    rentable: true,
+    reliability2: 0.98,
+    inet_down: 500,
+    machine_id: 4242,
+  };
+
+  const savedOpaBin = process.env.VAST_OPA_BIN;
+  afterEach(() => {
+    if (savedOpaBin === undefined) delete process.env.VAST_OPA_BIN;
+    else process.env.VAST_OPA_BIN = savedOpaBin;
+  });
+
+  it("refuses to rent when the gate cannot be evaluated, with NO assertGateFn supplied", async () => {
+    // Break the gate by pointing at a binary that does not exist. An offer that
+    // canRent() approves must still be refused, which can only happen if
+    // rentInstance really invokes OPA.
+    process.env.VAST_OPA_BIN = "/nonexistent/opa-for-this-test";
+
+    const putApiSpy = vi.fn();
+    const mockClient = { get: vi.fn(), put: putApiSpy } as unknown as VastClient;
+    const putLeaseSpy = vi.fn();
+
+    await expect(
+      rentInstance({
+        workload: EMBEDDING_WORKLOAD,
+        offer: cheapOffer,
+        creditUsd: 99,
+        currentInstanceCount: 0,
+        client: mockClient,
+        putLeaseFn: putLeaseSpy,
+        deleteLeaseFn: vi.fn(),
+      }),
+    ).rejects.toThrow(PolicyGateError);
+
+    // Nothing was rented and no lease intent was written: the refusal happened
+    // before any side effect, which is the only useful place for a spend gate.
+    expect(putApiSpy).not.toHaveBeenCalled();
+    expect(putLeaseSpy).not.toHaveBeenCalled();
+  });
+
+  it("passes the gate the instance LIST, never a bare count", async () => {
+    const seen: GateInput[] = [];
+    const mockClient = {
+      get: vi.fn(),
+      put: vi.fn().mockResolvedValue({ success: true, new_contract: 555 }),
+    } as unknown as VastClient;
+
+    await rentInstance({
+      workload: EMBEDDING_WORKLOAD,
+      offer: cheapOffer,
+      creditUsd: 99,
+      liveInstances: [{ id: 1 }],
+      client: mockClient,
+      putLeaseFn: vi.fn(),
+      deleteLeaseFn: vi.fn(),
+      assertGateFn: async (i) => {
+        seen.push(i);
+        return { allow: true, deny: [], limitsSeen: undefined };
+      },
+    });
+
+    expect(seen).toHaveLength(1);
+    expect(Array.isArray(seen[0]!.live_instances)).toBe(true);
+    expect(seen[0]!.live_instances).toHaveLength(1);
+    expect(seen[0]!.candidate.dph_total).toBe(0.12);
+    expect(seen[0]!.candidate.machine_id).toBe(4242);
+    expect(seen[0]!.action).toBe("rent");
+  });
+
+  it("synthesises a list of the right length when only a count is known", async () => {
+    // A count-only caller must not be able to hand the policy a scalar, which
+    // the policy refuses. Placeholders of the correct length keep it countable.
+    const seen: GateInput[] = [];
+    const mockClient = {
+      get: vi.fn(),
+      put: vi.fn().mockResolvedValue({ success: true, new_contract: 556 }),
+    } as unknown as VastClient;
+
+    await rentInstance({
+      workload: EMBEDDING_WORKLOAD,
+      offer: cheapOffer,
+      creditUsd: 99,
+      currentInstanceCount: 1,
+      client: mockClient,
+      putLeaseFn: vi.fn(),
+      deleteLeaseFn: vi.fn(),
+      assertGateFn: async (i) => {
+        seen.push(i);
+        return { allow: true, deny: [], limitsSeen: undefined };
+      },
+    });
+
+    expect(Array.isArray(seen[0]!.live_instances)).toBe(true);
+    expect(seen[0]!.live_instances).toHaveLength(1);
+  });
+
+  it("a gate denial stops the rent even when canRent() approved", async () => {
+    const putApiSpy = vi.fn();
+    const mockClient = { get: vi.fn(), put: putApiSpy } as unknown as VastClient;
+
+    await expect(
+      rentInstance({
+        workload: EMBEDDING_WORKLOAD,
+        offer: cheapOffer,
+        creditUsd: 99,
+        currentInstanceCount: 0,
+        client: mockClient,
+        putLeaseFn: vi.fn(),
+        deleteLeaseFn: vi.fn(),
+        assertGateFn: async () => {
+          throw new PolicyGateError("rent DENIED by OPA spend gate: VAST-SPEND-001: test");
+        },
+      }),
+    ).rejects.toThrow(/VAST-SPEND-001/);
+
+    expect(putApiSpy).not.toHaveBeenCalled();
+  });
+
+  it("queries the live instance list when neither list nor count is supplied", async () => {
+    // Proves the gate is fed real data rather than an assumption of zero.
+    const getSpy = vi.fn().mockResolvedValue({ instances: [{ id: 11 }, { id: 12 }] });
+    const mockClient = { get: getSpy, put: vi.fn() } as unknown as VastClient;
+    const seen: GateInput[] = [];
+
+    await expect(
+      rentInstance({
+        workload: EMBEDDING_WORKLOAD,
+        offer: cheapOffer,
+        creditUsd: 99,
+        client: mockClient,
+        putLeaseFn: vi.fn(),
+        deleteLeaseFn: vi.fn(),
+        assertGateFn: async (i) => {
+          seen.push(i);
+          return { allow: true, deny: [], limitsSeen: undefined };
+        },
+      }),
+      // canRent refuses at 2 instances before the gate is consulted; either way
+      // the list must have been fetched.
+    ).rejects.toThrow(VastRentRefusalError);
+
+    expect(getSpy).toHaveBeenCalledWith("/instances");
   });
 });
 

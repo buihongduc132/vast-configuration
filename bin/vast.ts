@@ -12,7 +12,7 @@
 import { normalizeGpuName } from "../src/api/url.js";
 import { VastClient } from "../src/api/client.js";
 import { WORKLOADS, getWorkload, type WorkloadId } from "../src/workloads.js";
-import { SPEND_LIMITS } from "../src/limits.js";
+import { SPEND_LIMITS, SPEND_LIMITS_PATH, maxConcurrentCostUsd } from "../src/limits.js";
 import { accruedCostUsd, isOurLabel } from "../src/instances/lease.js";
 import { selectOffer, selectCandidateOffers, type VastOffer } from "../src/offers/select.js";
 import { rentInstance, rentFirstAvailable, RENT_CONFIRM_TOKEN } from "../src/instances/rent.js";
@@ -109,7 +109,7 @@ async function cmdOffers(workloadId: string): Promise<void> {
   }
   console.log(
     `workload ${w.id}: needs >=${(w.minGpuRamMb / 1024).toFixed(0)}GiB VRAM, ` +
-      `>=${w.minDiskGb}GiB disk, <=$${SPEND_LIMITS.maxDphTotal}/hr\n`,
+      `>=${w.minDiskGb}GiB disk, <$${SPEND_LIMITS.maxDphPerInstance}/hr (strictly under)\n`,
   );
   if (offers.length === 0) {
     console.log(`NO ELIGIBLE OFFERS for gpu_name="${gpu}".`);
@@ -137,10 +137,14 @@ function cmdWorkloads(): void {
 }
 
 function cmdLimits(): void {
-  console.log(`max concurrent instances: ${SPEND_LIMITS.maxConcurrentInstances}`);
-  console.log(`max hourly price:         $${SPEND_LIMITS.maxDphTotal}`);
+  console.log(`max concurrent instances: ${SPEND_LIMITS.maxConcurrentInstances}  (VAST-SPEND-001, whole account)`);
+  console.log(`max hourly price:         <$${SPEND_LIMITS.maxDphPerInstance}/hr per instance  (VAST-SPEND-002, strictly under)`);
   console.log(`max lifetime:             ${SPEND_LIMITS.maxLifetimeMinutes} min`);
   console.log(`min credit floor:         $${SPEND_LIMITS.minCreditFloorUsd}`);
+  console.log(`worst case if both slots run full lifetime: $${maxConcurrentCostUsd().toFixed(4)}`);
+  console.log(`\nsource of truth: ${SPEND_LIMITS_PATH}`);
+  console.log(`enforced by:     policies/rego/vast_spend.rego via OPA (authoritative)`);
+  console.log(`                 src/limits.ts canRent() (defence in depth, same file)`);
 }
 
 async function cmdRent(workloadArg?: string): Promise<void> {

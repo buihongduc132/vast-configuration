@@ -19,6 +19,7 @@
 
 import { VastClient } from "../api/client.js";
 import { canRent, SPEND_LIMITS } from "../limits.js";
+import { assertRentAllowed, type GateInput, type GateVerdict } from "../policy/gate.js";
 import { getWorkload, type WorkloadId, type WorkloadSpec } from "../workloads.js";
 import { makeLeaseIntent, type Lease, type LeaseIntent } from "./lease.js";
 import { putLease, deleteLease, type KvOptions } from "../state/kv.js";
@@ -91,6 +92,18 @@ export interface RentInstanceArgs {
   readonly creditUsd?: number;
   /** Instance count override (if already queried). */
   readonly currentInstanceCount?: number;
+  /**
+   * The instances currently on the account, if already queried. Passed to the
+   * OPA gate, which refuses a bare count so a caller cannot understate
+   * concurrency.
+   */
+  readonly liveInstances?: readonly unknown[];
+  /**
+   * Test seam for the OPA gate. Defaults to the real `assertRentAllowed`, i.e.
+   * the gate is ON unless a test explicitly replaces it. A gate that must be
+   * opted into is not a gate.
+   */
+  readonly assertGateFn?: (input: GateInput) => Promise<GateVerdict>;
 }
 
 export interface RentResult {
@@ -112,17 +125,38 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
     creditUsd = Number(user.credit ?? 0);
   }
 
-  if (currentInstanceCount === undefined) {
-    const instRes = await client.get<unknown>("/instances");
-    let list: unknown[] = [];
-    if (Array.isArray(instRes)) {
-      list = instRes;
-    } else if (instRes && typeof instRes === "object" && Array.isArray((instRes as { instances?: unknown[] }).instances)) {
-      list = (instRes as { instances: unknown[] }).instances;
+  // The LIST is kept, not just its length: the OPA gate refuses a bare count so
+  // a caller cannot understate concurrency.
+  let liveInstances: readonly unknown[] | undefined = args.liveInstances;
+
+  if (liveInstances === undefined) {
+    if (currentInstanceCount === undefined) {
+      const instRes = await client.get<unknown>("/instances");
+      let list: unknown[] = [];
+      if (Array.isArray(instRes)) {
+        list = instRes;
+      } else if (
+        instRes &&
+        typeof instRes === "object" &&
+        Array.isArray((instRes as { instances?: unknown[] }).instances)
+      ) {
+        list = (instRes as { instances: unknown[] }).instances;
+      }
+      liveInstances = list;
+      currentInstanceCount = list.length;
+    } else {
+      // A count was supplied without the list (test/caller override). The policy
+      // only ever counts, so stand in opaque placeholders of the right length
+      // rather than inventing instance shapes.
+      liveInstances = Array.from({ length: currentInstanceCount }, () => ({
+        _placeholder: "count-only override",
+      }));
     }
-    currentInstanceCount = list.length;
+  } else if (currentInstanceCount === undefined) {
+    currentInstanceCount = liveInstances.length;
   }
 
+  // Local ceiling check first: fast, and it needs no subprocess.
   const decision = canRent({
     creditUsd,
     dphTotal: args.offer.dph_total,
@@ -132,6 +166,21 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
   if (!decision.allowed) {
     throw new VastRentRefusalError(decision.reason);
   }
+
+  // AUTHORITATIVE gate: policies/rego/vast_spend.rego via OPA. This throws on a
+  // denial AND on any failure to obtain a verdict, so "could not ask the policy"
+  // can never be mistaken for "the policy said yes". Deliberately placed before
+  // the lease-intent write — nothing at all should happen for a refused rent.
+  const assertGate = args.assertGateFn ?? ((i: GateInput) => assertRentAllowed(i));
+  await assertGate({
+    action: "rent",
+    candidate: {
+      id: args.offer.id,
+      dph_total: args.offer.dph_total,
+      ...(typeof args.offer.machine_id === "number" ? { machine_id: args.offer.machine_id } : {}),
+    },
+    live_instances: liveInstances,
+  });
 
   // 2. Prepare lease intent and write to Consul KV BEFORE rent call
   const owner = args.owner ?? "cli";
@@ -257,6 +306,9 @@ export interface RentCandidatesArgs {
   readonly deleteLeaseFn?: (label: string) => Promise<void>;
   readonly creditUsd?: number;
   readonly currentInstanceCount?: number;
+  readonly liveInstances?: readonly unknown[];
+  /** Test seam for the OPA gate; forwarded to every candidate attempt. */
+  readonly assertGateFn?: (input: GateInput) => Promise<GateVerdict>;
   readonly rentInstanceFn?: (args: RentInstanceArgs) => Promise<RentResult>;
   readonly destroyFn?: (instanceId: number) => Promise<unknown>;
   readonly waitForReady?: boolean;
@@ -295,10 +347,11 @@ export async function rentFirstAvailable(args: RentCandidatesArgs): Promise<Rent
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const candidate = candidates[attempt]!;
 
-    // Re-assert the price ceiling per candidate — never rent above cap on a retry
-    if (candidate.dph_total > SPEND_LIMITS.maxDphTotal) {
+    // Re-assert the price ceiling per candidate — never rent at or above the cap
+    // on a retry. STRICTLY under, matching VAST-SPEND-002.
+    if (candidate.dph_total >= SPEND_LIMITS.maxDphPerInstance) {
       throw new VastRentRefusalError(
-        `offer $${candidate.dph_total.toFixed(4)}/hr exceeds the $${SPEND_LIMITS.maxDphTotal}/hr cap`,
+        `offer $${candidate.dph_total.toFixed(4)}/hr is not strictly under the $${SPEND_LIMITS.maxDphPerInstance}/hr per-instance cap`,
       );
     }
 
@@ -316,6 +369,9 @@ export async function rentFirstAvailable(args: RentCandidatesArgs): Promise<Rent
         deleteLeaseFn: args.deleteLeaseFn,
         creditUsd: args.creditUsd,
         currentInstanceCount: args.currentInstanceCount,
+        liveInstances: args.liveInstances,
+        // Forwarded so every retry passes the same gate as the first attempt.
+        assertGateFn: args.assertGateFn,
       });
     } catch (err) {
       if (isNoSuchAskError(err)) {
