@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets — credentials come from Consul KV or env, NEVER a tracked file
+.env
+.env.*
+*.key
+*.pem
+secrets.json
+
+# Local state / scratch
+state/local/
+*.log
+.worktrees/

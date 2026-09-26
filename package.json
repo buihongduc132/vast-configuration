@@ -1,0 +1,22 @@
+{
+  "name": "vast-configuration",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vast.ai GPU rental lifecycle management — offer search, rent, provision, destroy, cost guard. Consumed by noco-mesh-infra as a submodule.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:live": "VAST_LIVE=1 vitest run --testNamePattern=live",
+    "typecheck": "tsc --noEmit",
+    "vast": "tsx bin/vast.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.0.0",
+    "vitest": "3.2.7"
+  }
+}
