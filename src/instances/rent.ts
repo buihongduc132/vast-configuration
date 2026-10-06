@@ -24,6 +24,7 @@ import { getWorkload, type WorkloadId, type WorkloadSpec } from "../workloads.js
 import { makeLeaseIntent, type Lease, type LeaseIntent } from "./lease.js";
 import { putLease, deleteLease, type KvOptions } from "../state/kv.js";
 import { buildEmbeddingProvisionConfig, type WorkloadProvisionConfig } from "../provision/embedding.js";
+import { buildComboProvisionConfig } from "../provision/combo.js";
 import { type VastOffer, NoEligibleOffersError } from "../offers/select.js";
 import { destroyInstance } from "./destroy.js";
 import {
@@ -207,6 +208,8 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
   if (!provision) {
     if (spec.id === "embedding") {
       provision = await buildEmbeddingProvisionConfig();
+    } else if (spec.id === "combo") {
+      provision = await buildComboProvisionConfig();
     } else {
       // Basic fallback for other workloads (e.g. qwen)
       provision = {
@@ -220,14 +223,18 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
   }
 
   // 4. Rent API call: PUT /asks/<offer_id>/
-  const rentBody = {
+  const rentBody: Record<string, unknown> = {
     client_id: "me",
     image: provision.image,
     disk: Math.max(spec.minDiskGb, Math.ceil(args.offer.disk_space)),
     label: intent.label,
     onstart: provision.onstart,
     env: provision.env,
-    runtype: "ssh",
+    runtype: (provision as { runtype?: string }).runtype ?? "ssh",
+    ...(provision.args && provision.args.length > 0 ? { args: provision.args } : {}),
+    ...("ports" in provision && Array.isArray((provision as { ports?: unknown[] }).ports)
+      ? { ports: (provision as { ports: unknown[] }).ports }
+      : {}),
   };
 
   let instanceId: number | undefined;

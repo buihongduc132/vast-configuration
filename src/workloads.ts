@@ -14,7 +14,7 @@
 /** Which site currently serves a workload. */
 export type Site = "local" | "vast";
 
-export type WorkloadId = "embedding" | "qwen";
+export type WorkloadId = "embedding" | "qwen" | "combo";
 
 export interface WorkloadSpec {
   readonly id: WorkloadId;
@@ -80,9 +80,30 @@ export const QWEN_WORKLOAD: WorkloadSpec = {
   weightsSizeGb: 3.9,
 };
 
+/**
+ * Combo workload: single Vast.ai instance co-locating TEI embedding producer
+ * (:8003) and vLLM LLM service (:8032) on a single 24 GB GPU (RTX 3090).
+ * Combined VRAM footprint is ~16.5 GB (0.62 vLLM + ~1.5 GB TEI), safely fitting 24 GB.
+ */
+export const COMBO_WORKLOAD: WorkloadSpec = {
+  id: "combo",
+  model: "Qwen/Qwen3-Embedding-0.6B + cyankiwi/Qwen3.5-4B-AWQ-4bit",
+  minGpuRamMb: 24576,
+  minDiskGb: 50,
+  port: 8003,
+  healthPath: "/health",
+  coldStartBudgetSec: 900,
+  weightsSizeGb: 6.4,
+};
+
+export const COMBO_PORTS = [8003, 8032] as const;
+
+export const COMBO_IMAGE = "ghcr.io/buihongduc132/vllm-tei-combo:latest";
+
 export const WORKLOADS: Readonly<Record<WorkloadId, WorkloadSpec>> = {
   embedding: EMBEDDING_WORKLOAD,
   qwen: QWEN_WORKLOAD,
+  combo: COMBO_WORKLOAD,
 };
 
 /**

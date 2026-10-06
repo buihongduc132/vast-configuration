@@ -231,11 +231,21 @@ export const CPU_BACKEND_PATTERNS = [
   "cuda_error_compat_not_supported",
 ] as const;
 
+export const CUDA_BACKEND_PATTERNS = [
+  /model\s+on\s+cuda/i,
+  /starting\s+.*?\bmodel\s+on\s+cuda\b/i,
+  /capturing\s+(?:the\s+)?model\s+for\s+cuda\s+graphs/i,
+  /#\s*gpu\s+blocks:\s*\d+/i,
+  /\bdevice=['"]?cuda/i,
+  /init_device=['"]?cuda/i,
+  /marlinlinearkernel/i,
+] as const;
+
 /**
  * Classify the backend compute device (cuda vs cpu vs unknown) from container log text.
  * Returns:
  *   - "cpu" if logs indicate CUDA failure or fallback to CPU
- *   - "cuda" if logs indicate model loaded on CUDA
+ *   - "cuda" if logs indicate model loaded on CUDA (TEI or vLLM)
  *   - "unknown" otherwise (unknown is NEVER assumed to be cuda)
  */
 export function classifyBackendDevice(logText: string | null | undefined): BackendDevice {
@@ -249,12 +259,51 @@ export function classifyBackendDevice(logText: string | null | undefined): Backe
     }
   }
 
-  // Matches "model on cuda" or "starting <x> model on cuda" (single or multi-word)
-  if (/model\s+on\s+cuda/i.test(clean) || /starting\s+.*?\bmodel\s+on\s+cuda\b/i.test(clean)) {
-    return "cuda";
+  // Matches CUDA patterns for TEI ("model on cuda") or vLLM (CUDA graphs, GPU blocks, device='cuda')
+  for (const pattern of CUDA_BACKEND_PATTERNS) {
+    if (pattern.test(clean)) {
+      return "cuda";
+    }
   }
 
   return "unknown";
+}
+
+/**
+ * Extract the public HostPort mapped to a container port from an instance object.
+ * Looks in instance.ports["<port>/tcp"][0].HostPort.
+ */
+export function getHostPort(
+  instance: InstanceStateInput | null | undefined,
+  containerPort: number,
+): number | undefined {
+  if (!instance || typeof instance !== "object") return undefined;
+  const ports = (instance as { ports?: Record<string, Array<{ HostPort?: string | number }>> }).ports;
+  if (!ports || typeof ports !== "object") return undefined;
+
+  const mapping = ports[`${containerPort}/tcp`] ?? ports[String(containerPort)];
+  if (Array.isArray(mapping) && mapping.length > 0 && mapping[0]?.HostPort != null) {
+    const p = Number(mapping[0].HostPort);
+    if (Number.isFinite(p) && p > 0) return p;
+  }
+  return undefined;
+}
+
+/**
+ * Extract all mapped host ports for a given set of container ports.
+ */
+export function getHostPorts(
+  instance: InstanceStateInput | null | undefined,
+  containerPorts: readonly number[] = [8003, 8032],
+): Record<number, number> {
+  const result: Record<number, number> = {};
+  for (const cp of containerPorts) {
+    const hp = getHostPort(instance, cp);
+    if (hp !== undefined) {
+      result[cp] = hp;
+    }
+  }
+  return result;
 }
 
 export class CpuBackendError extends FatalHostError {

@@ -272,3 +272,132 @@ export async function waitForEndpointHealth(
   throw new Error(`Endpoint ${baseUrl} did not report healthy within ${timeoutMs}ms`);
 }
 
+export class LlmGenerationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LlmGenerationError";
+  }
+}
+
+export interface ProbeLlmOptions extends ProbeOptions {
+  readonly model?: string;
+  readonly prompt?: string;
+}
+
+/**
+ * Probe an OpenAI-compatible LLM endpoint by posting a chat completion request to /v1/chat/completions
+ * and verifying that non-empty text is returned.
+ */
+export async function probeLlm(
+  baseUrl: string,
+  options?: ProbeLlmOptions,
+): Promise<string> {
+  const fetchImpl = options?.fetch ?? globalThis.fetch;
+  const timeoutMs = options?.timeoutMs ?? 30_000;
+  const model = options?.model ?? "cyankiwi/Qwen3.5-4B-AWQ-4bit";
+  const prompt = options?.prompt ?? "Reply with exactly 'OK'";
+
+  const cleanBase = baseUrl.replace(/\/+$/, "");
+  const chatUrl = `${cleanBase}/v1/chat/completions`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetchImpl(chatUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 16,
+        temperature: 0.1,
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    throw new LlmGenerationError(
+      `LLM probe connection failed to ${chatUrl}: ${(err as Error).message}`,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new LlmGenerationError(
+      `LLM probe failed: HTTP ${res.status} from ${chatUrl}: ${text.slice(0, 200)}`,
+    );
+  }
+
+  const json = (await res.json()) as {
+    choices?: Array<{
+      message?: { content?: string };
+      text?: string;
+    }>;
+  };
+
+  const choice = json.choices?.[0];
+  const content = choice?.message?.content?.trim() ?? choice?.text?.trim() ?? "";
+
+  if (!content) {
+    throw new LlmGenerationError(
+      `LLM probe returned empty completion: ${JSON.stringify(json).slice(0, 200)}`,
+    );
+  }
+
+  return content;
+}
+
+export interface VerifyComboOptions extends VerifyBackendOptions, ProbeOptions {
+  readonly embedBaseUrl?: string;
+  readonly llmBaseUrl?: string;
+  readonly llmModel?: string;
+}
+
+export interface ComboVerificationResult {
+  readonly backend: "cuda" | "unknown";
+  readonly embeddingDimension?: number;
+  readonly llmOutput?: string;
+  readonly warning?: string;
+}
+
+/**
+ * Complete verification for dual-workload combo instance:
+ * 1. Verifies backend device from container logs (rejects CPU fallback)
+ * 2. If embedBaseUrl supplied, probes TEI /embed and asserts 1024-dim
+ * 3. If llmBaseUrl supplied, probes vLLM /v1/chat/completions and asserts functional generation
+ */
+export async function verifyComboProvisioning(
+  instanceId: number,
+  options?: VerifyComboOptions,
+): Promise<ComboVerificationResult> {
+  const backendResult = await verifyBackendDevice(instanceId, options);
+
+  let embeddingDimension: number | undefined;
+  if (options?.embedBaseUrl) {
+    const vector = await probeEmbedding(options.embedBaseUrl, options);
+    embeddingDimension = vector.length;
+  }
+
+  let llmOutput: string | undefined;
+  if (options?.llmBaseUrl) {
+    llmOutput = await probeLlm(options.llmBaseUrl, {
+      ...options,
+      model: options.llmModel,
+    });
+  }
+
+  return {
+    backend: backendResult.device,
+    embeddingDimension,
+    llmOutput,
+    warning: backendResult.warning,
+  };
+}
+

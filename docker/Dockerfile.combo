@@ -1,0 +1,34 @@
+# =============================================================================
+# Dockerfile.combo — Single image running BOTH TEI and vLLM
+#
+# Workloads:
+#   1. text-embeddings-router (TEI 1.9.3) serving Qwen3-Embedding-0.6B on :8003
+#   2. vLLM (OpenAI-compatible server) serving Qwen3.5-4B-AWQ-4bit on :8032
+#
+# Target GPU: 1x RTX 3090 (24 GB VRAM)
+# Memory split:
+#   - vLLM: 0.62 util (~14.9 GB)
+#   - TEI: ~1.5 GB
+#   - Combined: ~16.5 GB (fits within 24 GB)
+# =============================================================================
+
+FROM ghcr.io/huggingface/text-embeddings-inference:1.9.3 AS tei-source
+
+FROM vllm/vllm-openai:latest
+
+# Copy precompiled text-embeddings-router binary from TEI image
+COPY --from=tei-source /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router
+RUN chmod +x /usr/local/bin/text-embeddings-router
+
+# Ensure dependencies (standard curl, jq, procps)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    jq \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Expose both service ports
+EXPOSE 8003 8032
+
+# Default entrypoint left open for Vast.ai onstart override
+CMD ["/bin/bash"]
