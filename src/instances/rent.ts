@@ -20,7 +20,7 @@
 import { VastClient } from "../api/client.js";
 import { canRent, SPEND_LIMITS } from "../limits.js";
 import { assertRentAllowed, type GateInput, type GateVerdict } from "../policy/gate.js";
-import { getWorkload, type WorkloadId, type WorkloadSpec } from "../workloads.js";
+import { getWorkload, COMBO_PORTS, type WorkloadId, type WorkloadSpec } from "../workloads.js";
 import { makeLeaseIntent, type Lease, type LeaseIntent } from "./lease.js";
 import { putLease, deleteLease, type KvOptions } from "../state/kv.js";
 import { buildEmbeddingProvisionConfig, type WorkloadProvisionConfig } from "../provision/embedding.js";
@@ -29,6 +29,7 @@ import { type VastOffer, NoEligibleOffersError } from "../offers/select.js";
 import { destroyInstance } from "./destroy.js";
 import {
   waitForInstanceReady,
+  getHostPorts,
   FatalHostError,
   TerminalInstanceStateError,
   CpuBackendError,
@@ -109,6 +110,8 @@ export interface RentInstanceArgs {
    * opted into is not a gate.
    */
   readonly assertGateFn?: (input: GateInput) => Promise<GateVerdict>;
+  /** Optional registry login string passed to Vast (e.g. "-u <user> -p <token> ghcr.io"). */
+  readonly imageLogin?: string;
 }
 
 export interface RentResult {
@@ -196,6 +199,7 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
     dphTotal: args.offer.dph_total,
     owner,
     maxLifetimeMinutes,
+    ports: spec.id === "combo" ? COMBO_PORTS : [spec.port],
   });
 
   const recordIntent = args.putLeaseFn ?? ((l) => putLease(l, args.kvOptions));
@@ -223,18 +227,48 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
   }
 
   // 4. Rent API call: PUT /asks/<offer_id>/
+  // Vast.ai honors port exposure via `-p <container_port>:<container_port>` flags inside the `env` string.
+  // When multiple ports are specified (e.g. combo workload), format them into `env` with `runtype: "args"`.
+  let env: unknown = provision.env;
+  let runtype = (provision as { runtype?: string }).runtype ?? "ssh";
+  let portsToExpose: readonly number[] = [provision.port];
+
+  if ("ports" in provision && Array.isArray((provision as { ports?: unknown[] }).ports)) {
+    portsToExpose = (provision as { ports: readonly number[] }).ports;
+    const portFlags = portsToExpose.map((p) => `-p ${p}:${p}`).join(" ");
+    runtype = (provision as { runtype?: string }).runtype ?? "args";
+
+    if (typeof provision.env === "string") {
+      env = `${portFlags} ${provision.env}`.trim();
+    } else if (provision.env && typeof provision.env === "object") {
+      const envFlags = Object.entries(provision.env)
+        .filter(([_, v]) => v !== undefined && v !== null && v !== "")
+        .map(([k, v]) => `-e ${k}=${v}`)
+        .join(" ");
+      env = [portFlags, envFlags].filter(Boolean).join(" ");
+    } else {
+      env = portFlags;
+    }
+  }
+
+  let onstartCmd = provision.onstart;
+  let runArgs = provision.args;
+
+  if (runtype === "args" && onstartCmd && (onstartCmd.includes("\n") || onstartCmd.startsWith("#!"))) {
+    runArgs = ["-c", onstartCmd];
+    onstartCmd = "bash";
+  }
+
   const rentBody: Record<string, unknown> = {
     client_id: "me",
     image: provision.image,
     disk: Math.max(spec.minDiskGb, Math.ceil(args.offer.disk_space)),
     label: intent.label,
-    onstart: provision.onstart,
-    env: provision.env,
-    runtype: (provision as { runtype?: string }).runtype ?? "ssh",
-    ...(provision.args && provision.args.length > 0 ? { args: provision.args } : {}),
-    ...("ports" in provision && Array.isArray((provision as { ports?: unknown[] }).ports)
-      ? { ports: (provision as { ports: unknown[] }).ports }
-      : {}),
+    onstart: onstartCmd,
+    env,
+    runtype,
+    ...(runArgs && runArgs.length > 0 ? { args: runArgs } : {}),
+    ...(args.imageLogin ? { image_login: args.imageLogin } : {}),
   };
 
   let instanceId: number | undefined;
@@ -289,10 +323,12 @@ export async function rentInstance(args: RentInstanceArgs): Promise<RentResult> 
     throw err;
   }
 
-  // 5. On success record instanceId into the same KV key
+  // 5. On success record instanceId into the same KV key with complete dual-service mesh registration
   const confirmedLease: Lease = {
     ...intent,
     instanceId,
+    ports: portsToExpose,
+    services: intent.services,
   };
 
   await recordIntent(confirmedLease);
@@ -417,9 +453,49 @@ export async function rentFirstAvailable(args: RentCandidatesArgs): Promise<Rent
           assertBackendVerified(backendResult, rentResult.instanceId);
         }
 
-        // Live instance price update (price drift)
+        // Live instance price update (price drift) and host ports mapping
         const actualDph =
           readyInstance.dph_total != null ? Number(readyInstance.dph_total) : rentResult.dphTotal;
+
+        const portsToMap = spec.id === "combo" ? COMBO_PORTS : [spec.port];
+        const hostPorts = getHostPorts(readyInstance, portsToMap);
+        const publicIp = typeof readyInstance.public_ipaddr === "string" ? readyInstance.public_ipaddr : undefined;
+        const endpoints: Record<string, string> = {};
+        if (publicIp) {
+          if (spec.id === "combo") {
+            if (hostPorts[8003]) endpoints.embedding = `http://${publicIp}:${hostPorts[8003]}`;
+            if (hostPorts[8032]) endpoints.qwen = `http://${publicIp}:${hostPorts[8032]}`;
+          } else {
+            if (hostPorts[spec.port]) endpoints[spec.id] = `http://${publicIp}:${hostPorts[spec.port]}`;
+          }
+        }
+
+        const nowMs = now();
+        const updatedLease: Lease = {
+          label: rentResult.label,
+          workload: spec.id,
+          offerId: candidate.id,
+          dphTotal: actualDph,
+          createdAtMs: nowMs,
+          expiresAtMs: nowMs + (args.maxLifetimeMinutes ?? SPEND_LIMITS.maxLifetimeMinutes) * 60_000,
+          owner: args.owner ?? "cli",
+          instanceId: rentResult.instanceId,
+          ports: portsToMap,
+          hostPorts,
+          publicIp,
+          endpoints,
+          services: spec.id === "combo"
+            ? [
+                { name: "embedding", containerPort: 8003, hostPort: hostPorts[8003], endpoint: endpoints.embedding },
+                { name: "qwen", containerPort: 8032, hostPort: hostPorts[8032], endpoint: endpoints.qwen },
+              ]
+            : [
+                { name: spec.id, containerPort: spec.port, hostPort: hostPorts[spec.port], endpoint: endpoints[spec.id] },
+              ],
+        };
+        await Promise.resolve(
+          (args.putLeaseFn ?? ((l) => putLease(l, args.kvOptions)))(updatedLease),
+        ).catch(() => {});
 
         return {
           instanceId: rentResult.instanceId,

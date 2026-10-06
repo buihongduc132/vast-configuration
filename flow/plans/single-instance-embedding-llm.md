@@ -29,11 +29,11 @@ My v1 used the repo's `minGpuRamMb` **spec constants** (embedding 8192 + qwen 24
 **⇒ A single 24 GB card (RTX 3090, ~$0.11/hr) runs BOTH.** No 32 GB GPU, no gate bump, no contract change. The entire "spend-gate conflict" in v1 is VOID.
 
 ## DOD (Definition of Done)
-- [x] One Vast.ai instance serves BOTH the embedding producer (TEI, Qwen3-Embedding-0.6B, 1024-dim, mean pooling, :8003) AND qwen (vLLM, Qwen3.5-4B-AWQ-4bit, :8032) simultaneously, on a **single 24 GB GPU**.
-- [x] Both endpoints healthy; embedding dimension asserted 1024; backend device asserted CUDA (not CPU fallback) for both.
-- [x] vLLM launched with the SAME args as production: `--max-model-len 262144 --gpu-memory-utilization 0.62 --max-num-seqs 4 --cpu-offload-gb 0`.
-- [x] TEI launched with `--model-id Qwen/Qwen3-Embedding-0.6B --port 8003 --pooling mean`.
-- [x] Rental recorded (declared infra); matching destroy path runs on failure.
+- [x] One Vast.ai instance serves BOTH the embedding producer (TEI, Qwen3-Embedding-0.6B, 1024-dim, mean pooling, :8003) AND qwen (vLLM, Qwen3.5-4B-AWQ-4bit, :8032) simultaneously, on a **single 24 GB GPU** (PROVEN: instance `54520190`, RTX 3090 24GB on Hetzner host `95.217.191.164` at $0.1755/hr, ports 9683/9684, 2026-10-07T00:44-01:04).
+- [x] Both endpoints healthy; embedding dimension asserted 1024; backend device asserted CUDA (not CPU fallback) for both (PROVEN: TEI `:8003` -> HTTP 200, vLLM `:8032` -> HTTP 200, `/embed` dim = 1024, `/v1/chat/completions` valid generation, backend device = `cuda`).
+- [x] vLLM launched with the SAME args as production: `--max-model-len 262144 --gpu-memory-utilization 0.62 --max-num-seqs 4 --cpu-offload-gb 0` (PROVEN: verified in instance args and supervisor startup).
+- [x] TEI launched with `--model-id Qwen/Qwen3-Embedding-0.6B --port 8003 --pooling mean` (PROVEN: verified in supervisor startup and TEI router logs).
+- [x] Rental recorded (declared infra); matching destroy path runs on failure (PROVEN: recorded to Consul KV `vast/leases/nocomesh-offload--combo--liveproof--1791308651`, destroyed in exit trap and verified absent twice).
 
 ## Tasks
 
@@ -69,9 +69,16 @@ My v1 used the repo's `minGpuRamMb` **spec constants** (embedding 8192 + qwen 24
 
 ## Proof (per implemented item)
 - Unit tests: `tests/combo.test.ts` (11 tests covering spec, selection, dual-onstart, dual-ports rent, CUDA markers, probeLlm, verifyComboProvisioning).
-- Full suite passing: 16 test files, 247 tests passing (`vitest run`).
+- Full suite passing: 16 test files, 248 tests passing (`vitest run`).
 - TypeScript compile clean: `tsc --noEmit`.
-- Live proof script: `scripts/live-combo-proof.sh` (validates end-to-end rental, startup, dual /health, 1024-dim /embed, LLM text completion, and teardown).
+- Live proof script: `scripts/live-combo-proof.sh` run `/tmp/vast-combo-proof-20261007T003349/run.log`:
+  - Rented instance `54520190` on Hetzner host `95.217.191.164` (RTX 3090 24GB, $0.1755/hr)
+  - Endpoints mapped: TEI `http://95.217.191.164:9683`, vLLM `http://95.217.191.164:9684`
+  - Health checks: TEI `:8003` -> 200, vLLM `:8032` -> 200
+  - Backend device: `cuda` (native CUDA, no CPU fallback)
+  - Probe 1 `/embed`: returned dimension 1024
+  - Probe 2 `/v1/chat/completions`: returned valid LLM generation
+  - Teardown: instance 54520190 destroyed and verified absent twice from active instances
 
 ## Idempotency
 Re-running reconciles to THIS plan; item prose not rewritten; status flips only.

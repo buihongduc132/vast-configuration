@@ -16,19 +16,16 @@ FROM ghcr.io/huggingface/text-embeddings-inference:1.9.3 AS tei-source
 
 FROM vllm/vllm-openai:latest
 
-# Copy precompiled text-embeddings-router binary from TEI image
+# Copy precompiled text-embeddings-router binary and CUDA compat runtime from TEI image
 COPY --from=tei-source /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router
 RUN chmod +x /usr/local/bin/text-embeddings-router
 
-# Ensure dependencies (standard curl, jq, procps)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    jq \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
 
 # Expose both service ports
 EXPOSE 8003 8032
+
+LABEL org.opencontainers.image.source="https://github.com/buihongduc132/vast-configuration"
+
 
 # Default entrypoint left open for Vast.ai onstart override
 CMD ["/bin/bash"]

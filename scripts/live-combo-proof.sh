@@ -23,24 +23,27 @@ CONFIRM_TOKEN="i-accept-gpu-rental-charges"
 LABEL_PREFIX="nocomesh-offload"
 
 MAX_DPH="${MAX_DPH:-0.20}"
-GLOBAL_DEADLINE_MIN="${GLOBAL_DEADLINE_MIN:-45}"
-CANDIDATE_DEADLINE_MIN="${CANDIDATE_DEADLINE_MIN:-8}"
-HEALTH_WAIT_MIN="${HEALTH_WAIT_MIN:-15}"
+GLOBAL_DEADLINE_MIN="${GLOBAL_DEADLINE_MIN:-60}"
+CANDIDATE_DEADLINE_MIN="${CANDIDATE_DEADLINE_MIN:-15}"
+HEALTH_WAIT_MIN="${HEALTH_WAIT_MIN:-10}"
 MAX_CANDIDATES="${MAX_CANDIDATES:-5}"
 MIN_CREDIT="5.0"
+REQUIRE_STATIC_IP="${REQUIRE_STATIC_IP:-true}"
 
-COMBO_IMAGE="${COMBO_IMAGE:-ghcr.io/buihongduc132/vllm-tei-combo:latest}"
+COMBO_IMAGE="${COMBO_IMAGE:-ghcr.io/buihongduc132/vllm-tei-combo:v2}"
 EMBED_PORT=8003
 LLM_PORT=8032
 DISK_GB=50
 EXPECTED_DIM=1024
-MIN_CUDA="${MIN_CUDA:-12.8}"
+MIN_CUDA="${MIN_CUDA:-13.0}"
 EXCLUDE_GEO="${VAST_EXCLUDE_GEO:-CN}"
 
 BLOCKLIST_FILE="${BLOCKLIST_FILE:-$HOME/.vast-host-blocklist}"
 touch "$BLOCKLIST_FILE" 2>/dev/null || BLOCKLIST_FILE=/dev/null
+export REQUIRE_STATIC_IP BLOCKLIST_FILE EXCLUDE_GEO
 
 CURRENT_INSTANCE=""
+CURRENT_LABEL=""
 START_EPOCH=$(date +%s)
 TOTAL_BILLED_SECONDS=0
 EVIDENCE_DIR="${EVIDENCE_DIR:-/tmp/vast-combo-proof-$(date +%Y%m%dT%H%M%S)}"
@@ -60,11 +63,11 @@ export VAST_API_KEY
 api() {
   local method="$1" path="$2" body="${3:-}"
   if [[ -n "$body" ]]; then
-    curl -sS --max-time 60 -X "$method" \
+    curl -sS --retry 3 --retry-connrefused --retry-delay 2 --max-time 60 -X "$method" \
       -H "Authorization: Bearer $VAST_API_KEY" \
       -H "Content-Type: application/json" -d "$body" "${API}${path}"
   else
-    curl -sS --max-time 60 -X "$method" \
+    curl -sS --retry 3 --retry-connrefused --retry-delay 2 --max-time 60 -X "$method" \
       -H "Authorization: Bearer $VAST_API_KEY" -H "Accept: application/json" "${API}${path}"
   fi
 }
@@ -78,13 +81,17 @@ blocklist_add() {
 }
 
 instance_logs() {
-  local id="$1" n="${2:-100}" url
-  url=$(api PUT "/instances/request_logs/${id}/" "{\"tail\":\"${n}\"}" \
-        | python3 -c "
+  local id="$1" n="${2:-100}" url=""
+  for r in 1 2 3; do
+    url=$(api PUT "/instances/request_logs/${id}/" "{\"tail\":\"${n}\"}" \
+          | python3 -c "
 import json,sys
 try: print(json.load(sys.stdin).get('result_url',''))
 except Exception: print('')
 ")
+    [[ -n "$url" ]] && break
+    sleep 3
+  done
   [[ -n "$url" ]] || return 1
   sleep 6
   curl -sS --max-time 40 "$url" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'
@@ -96,7 +103,7 @@ backend_device() {
   printf '%s' "$logs" > "$EVIDENCE_DIR/logs-$1.txt"
   if grep -qiE "using cpu instead|model on cpu|cuda is not available|CUDA_ERROR_COMPAT_NOT_SUPPORTED" <<<"$logs"; then
     echo "cpu"
-  elif grep -qiE "model on cuda|starting .* model on cuda|capturing .* model for cuda graphs|# gpu blocks:|device=['\"]?cuda|marlinlinearkernel" <<<"$logs"; then
+  elif grep -qiE "model on cuda|starting .* model on cuda|capturing .* model for cuda graphs|# gpu blocks:|gpu blocks:|available gpu memory|device=['\"]?cuda|marlinlinearkernel|flashattention" <<<"$logs"; then
     echo "cuda"
   else
     echo "unknown"
@@ -108,6 +115,9 @@ destroy_and_verify() {
   [[ -n "$id" ]] || return 0
   log "  destroying instance $id"
   api DELETE "/instances/${id}/" > "$EVIDENCE_DIR/destroy-${id}.json" 2>&1
+  if [[ -n "${CURRENT_LABEL:-}" ]]; then
+    consul kv delete "vast/leases/${CURRENT_LABEL}" 2>/dev/null || true
+  fi
   for i in 1 2 3 4 5 6 7 8; do
     sleep 12
     present=$(api GET "/instances/" | python3 -c "
@@ -190,6 +200,7 @@ try:
         if tok: blocked.add(tok[0])
 except Exception: pass
 excl=[x.strip().lower() for x in os.environ.get('EXCLUDE_GEO','').split(',') if x.strip()]
+require_static = os.environ.get('REQUIRE_STATIC_IP', 'true').lower() == 'true'
 def geo_ok(o):
     g=str(o.get('geolocation') or '').lower()
     return not any(e in g for e in excl)
@@ -200,14 +211,22 @@ offers=[o for o in d.get('offers',[])
         and o.get('rentable') is True and not o.get('is_bid')
         and o.get('cuda_max_good') and float(o['cuda_max_good']) >= $MIN_CUDA
         and geo_ok(o)
+        and (not require_static or o.get('static_ip') is True)
+        and float(o.get('inet_down') or 0) >= 100.0
         and str(o.get('machine_id')) not in blocked]
-offers.sort(key=lambda o: (-float(o.get('reliability2') or 0), float(o['dph_total']), -float(o.get('inet_down') or 0)))
+offers.sort(key=lambda o: (
+    0 if o.get('static_ip') is True else 1,
+    -float(o.get('reliability2') or 0),
+    float(o['dph_total']),
+    -float(o.get('inet_down') or 0)
+))
 with open('$EVIDENCE_DIR/candidates.tsv','w') as f:
     for o in offers:
         f.write('\t'.join(str(x) for x in [
             o['id'], o['dph_total'], o.get('gpu_ram'), o.get('disk_space'),
             str(o.get('geolocation')).replace(' ','_'), o.get('reliability2'),
             o.get('inet_down') or 0, o.get('machine_id') or 0,
+            o.get('static_ip') or False,
         ])+'\n')
 print(len(offers))
 " > "$EVIDENCE_DIR/candidate-count.txt"
@@ -222,7 +241,29 @@ GLOBAL_DEADLINE=$(( START_EPOCH + GLOBAL_DEADLINE_MIN*60 ))
 try_combo_candidate() {
   local offer_id="$1" dph="$2" machine_id="${3:-}"
   local label="${LABEL_PREFIX}--combo--liveproof--$(date +%s)"
+  CURRENT_LABEL="$label"
   local rent_file="$EVIDENCE_DIR/rent-${offer_id}.json"
+  local lease_key="vast/leases/${label}"
+  local now_ms; now_ms=$(date +%s000)
+
+  # 1. Write dual-service lease intent to Consul KV BEFORE rent call (crash-safety)
+  python3 -c "
+import json
+print(json.dumps({
+  'label': '$label',
+  'workload': 'combo',
+  'offerId': $offer_id,
+  'dphTotal': float('$dph'),
+  'createdAtMs': $now_ms,
+  'expiresAtMs': $now_ms + 45*60000,
+  'owner': 'live-combo-proof',
+  'ports': [$EMBED_PORT, $LLM_PORT],
+  'services': [
+    {'name': 'embedding', 'containerPort': $EMBED_PORT},
+    {'name': 'qwen', 'containerPort': $LLM_PORT},
+  ],
+}))
+" | consul kv put "$lease_key" - 2>/dev/null || true
 
   # Supervised dual onstart
   local onstart
@@ -236,6 +277,7 @@ if [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
   export HF_TOKEN="${HUGGING_FACE_HUB_TOKEN}"
 fi
 
+
 TEI_PID=""
 VLLM_PID=""
 cleanup() {
@@ -247,13 +289,22 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT
 
-# Start TEI
+# Start TEI (output teed to both stdout and /var/log/tei.log for Vast log scraping)
 if command -v text-embeddings-router >/dev/null 2>&1; then
-  text-embeddings-router --model-id "Qwen/Qwen3-Embedding-0.6B" --port 8003 --pooling mean > /var/log/tei.log 2>&1 &
+  text-embeddings-router \
+    --model-id "Qwen/Qwen3-Embedding-0.6B" \
+    --port 8003 \
+    --pooling mean \
+    --max-client-batch-size 32 \
+    2>&1 | tee -a /var/log/tei.log &
   TEI_PID=$!
+  echo "[combo-supervisor] TEI started with PID $TEI_PID"
+else
+  echo "[combo-supervisor] FATAL: text-embeddings-router binary not found" >&2
+  exit 127
 fi
 
-# Start vLLM
+# Start vLLM (output teed to both stdout and /var/log/vllm.log for Vast log scraping)
 python3 -m vllm.entrypoints.openai.api_server \
   --model "cyankiwi/Qwen3.5-4B-AWQ-4bit" \
   --host 0.0.0.0 \
@@ -262,17 +313,21 @@ python3 -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization 0.62 \
   --max-num-seqs 4 \
   --cpu-offload-gb 0 \
-  --trust-remote-code > /var/log/vllm.log 2>&1 &
+  --trust-remote-code \
+  2>&1 | tee -a /var/log/vllm.log &
 VLLM_PID=$!
+echo "[combo-supervisor] vLLM started with PID $VLLM_PID"
 
 while true; do
   if [[ -n "$TEI_PID" ]] && ! kill -0 "$TEI_PID" 2>/dev/null; then
     echo "[combo-supervisor] TEI exited!" >&2
+    tail -n 40 /var/log/tei.log >&2 || true
     cleanup
     exit 1
   fi
   if [[ -n "$VLLM_PID" ]] && ! kill -0 "$VLLM_PID" 2>/dev/null; then
     echo "[combo-supervisor] vLLM exited!" >&2
+    tail -n 40 /var/log/vllm.log >&2 || true
     cleanup
     exit 2
   fi
@@ -281,23 +336,31 @@ done
 EOF
 )
 
+  local gh_token
+  gh_token="$(consul kv get creds/common/github/token 2>/dev/null || echo '')"
+
   local body
-  body=$(HF_TOKEN="$HF_TOKEN" ONSTART="$onstart" python3 -c "
+  body=$(HF_TOKEN="$HF_TOKEN" GH_TOKEN="$gh_token" ONSTART="$onstart" python3 -c "
 import json, os
 env=('-p ${EMBED_PORT}:${EMBED_PORT} -p ${LLM_PORT}:${LLM_PORT} '
      '-e HUGGING_FACE_HUB_TOKEN=' + os.environ.get('HF_TOKEN','') + ' '
      '-e HF_TOKEN=' + os.environ.get('HF_TOKEN','') + ' '
      '-e HF_HUB_ENABLE_HF_TRANSFER=0')
-print(json.dumps({
+payload = {
   'image': '$COMBO_IMAGE',
   'disk': $DISK_GB,
   'label': '$label',
   'runtype': 'args',
   'env': env,
-  'onstart': os.environ.get('ONSTART',''),
+  'onstart': 'bash',
+  'args': ['-c', os.environ.get('ONSTART','')],
   'target_state': 'running',
   'cancel_unavail': True,
-}))
+}
+gh_token = os.environ.get('GH_TOKEN','').strip()
+if gh_token:
+  payload['image_login'] = f'-u buihongduc132 -p {gh_token} ghcr.io'
+print(json.dumps(payload))
 ")
   api PUT "/asks/${offer_id}/" "$body" > "$rent_file"
 
@@ -310,12 +373,33 @@ print(bool(d.get('success')), d.get('new_contract') or '')
 ")"
   if [[ "$ok" != "True" || -z "$newid" ]]; then
     log "  offer $offer_id unavailable; advancing"
+    consul kv delete "$lease_key" 2>/dev/null || true
     return 1
   fi
 
   CURRENT_INSTANCE="$newid"
   local rent_epoch=$(date +%s)
   log "  RENTED combo box $newid at \$$dph/hr (label $label)"
+
+  # Record confirmed dual-service lease in Consul KV
+  python3 -c "
+import json
+print(json.dumps({
+  'label': '$label',
+  'workload': 'combo',
+  'offerId': $offer_id,
+  'dphTotal': float('$dph'),
+  'createdAtMs': $now_ms,
+  'expiresAtMs': $now_ms + 45*60000,
+  'owner': 'live-combo-proof',
+  'instanceId': int('$newid'),
+  'ports': [$EMBED_PORT, $LLM_PORT],
+  'services': [
+    {'name': 'embedding', 'containerPort': $EMBED_PORT},
+    {'name': 'qwen', 'containerPort': $LLM_PORT},
+  ],
+}))
+" | consul kv put "$lease_key" - 2>/dev/null || true
 
   # Wait for container running + both ports mapped
   local cdeadline=$(( rent_epoch + CANDIDATE_DEADLINE_MIN*60 ))
@@ -362,18 +446,53 @@ else:
   local base_llm="http://${ip}:${hp_llm}"
   log "  endpoints mapped: embedding=$base_embed, llm=$base_llm"
 
+  # Update Consul KV lease with resolved host ports and public endpoints
+  python3 -c "
+import json
+print(json.dumps({
+  'label': '$label',
+  'workload': 'combo',
+  'offerId': $offer_id,
+  'dphTotal': float('$dph'),
+  'createdAtMs': $now_ms,
+  'expiresAtMs': $now_ms + 45*60000,
+  'owner': 'live-combo-proof',
+  'instanceId': int('$newid'),
+  'ports': [$EMBED_PORT, $LLM_PORT],
+  'hostPorts': {$EMBED_PORT: int('$hp_embed'), $LLM_PORT: int('$hp_llm')},
+  'publicIp': '$ip',
+  'endpoints': {
+    'embedding': 'http://${ip}:${hp_embed}',
+    'qwen': 'http://${ip}:${hp_llm}',
+  },
+  'services': [
+    {'name': 'embedding', 'containerPort': $EMBED_PORT, 'hostPort': int('$hp_embed'), 'endpoint': 'http://${ip}:${hp_embed}'},
+    {'name': 'qwen', 'containerPort': $LLM_PORT, 'hostPort': int('$hp_llm'), 'endpoint': 'http://${ip}:${hp_llm}'},
+  ],
+}))
+" | consul kv put "$lease_key" - 2>/dev/null || true
+
   # Wait for health on both endpoints
   local hdeadline=$(( $(date +%s) + HEALTH_WAIT_MIN*60 ))
-  local healthy_emb=0 healthy_llm=0
+  local healthy_emb=0 healthy_llm=0 poll_round=0
   while [[ $(date +%s) -lt $hdeadline ]]; do
+    poll_round=$((poll_round + 1))
+    local code_e="000" code_l="000"
     if [[ $healthy_emb -eq 0 ]]; then
-      local code_e; code_e=$(curl -sS --max-time 10 -o /dev/null -w "%{http_code}" "$base_embed/health" 2>/dev/null || echo "000")
+      code_e=$(curl -sS --max-time 10 -o /dev/null -w "%{http_code}" "$base_embed/health" 2>/dev/null || true)
+      code_e="${code_e:-000}"
       [[ "$code_e" == "200" ]] && { healthy_emb=1; log "    TEI :8003 healthy"; }
+    else
+      code_e="200"
     fi
     if [[ $healthy_llm -eq 0 ]]; then
-      local code_l; code_l=$(curl -sS --max-time 10 -o /dev/null -w "%{http_code}" "$base_llm/health" 2>/dev/null || echo "000")
+      code_l=$(curl -sS --max-time 10 -o /dev/null -w "%{http_code}" "$base_llm/health" 2>/dev/null || true)
+      code_l="${code_l:-000}"
       [[ "$code_l" == "200" ]] && { healthy_llm=1; log "    vLLM :8032 healthy"; }
+    else
+      code_l="200"
     fi
+    log "    health poll #${poll_round}: tei=${code_e} vllm=${code_l}"
     if [[ $healthy_emb -eq 1 && $healthy_llm -eq 1 ]]; then
       break
     fi

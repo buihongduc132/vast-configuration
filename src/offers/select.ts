@@ -15,7 +15,7 @@ import { SPEND_LIMITS } from "../limits.js";
 import { getWorkload, type WorkloadId, type WorkloadSpec } from "../workloads.js";
 import { HostBlocklist, loadBlocklist } from "../instances/blocklist.js";
 
-export const DEFAULT_MIN_CUDA = 12.8;
+export const DEFAULT_MIN_CUDA = 13.0;
 
 export interface VastOffer {
   readonly id: number;
@@ -31,6 +31,7 @@ export interface VastOffer {
   readonly storage_cost?: number;
   readonly geolocation?: string;
   readonly cuda_max_good?: number | string | null;
+  readonly static_ip?: boolean | null;
   readonly [key: string]: unknown;
 }
 
@@ -152,9 +153,16 @@ export function selectCandidateOffers(
     throw new NoEligibleOffersError(spec, offers.length);
   }
 
-  // Sort: prefer verified bandwidth (>0) over unmeasured (0/missing),
+  // Sort: prefer static_ip (true before false/missing for accessible public port forwarding),
+  // then verified bandwidth (>0) over unmeasured (0/missing),
   // then higher reliability2, then lower dph_total, then higher inet_down
   return [...eligible].sort((a, b) => {
+    const statA = a.static_ip === true ? 1 : 0;
+    const statB = b.static_ip === true ? 1 : 0;
+    if (statA !== statB) {
+      return statB - statA; // static_ip first
+    }
+
     const hasNetA = a.inet_down != null && a.inet_down > 0 ? 1 : 0;
     const hasNetB = b.inet_down != null && b.inet_down > 0 ? 1 : 0;
     if (hasNetA !== hasNetB) {

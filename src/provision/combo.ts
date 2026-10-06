@@ -64,6 +64,7 @@ if [[ -n "\${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
   export HF_TOKEN="\${HUGGING_FACE_HUB_TOKEN}"
 fi
 
+
 TEI_PID=""
 VLLM_PID=""
 
@@ -88,7 +89,8 @@ if command -v text-embeddings-router >/dev/null 2>&1; then
     --model-id "${embedModel}" \
     --port ${embedPort} \
     --pooling "${pooling}" \
-    > /var/log/tei.log 2>&1 &
+    --max-client-batch-size 32 \
+    2>&1 | tee -a /var/log/tei.log &
   TEI_PID=$!
   echo "[vast-combo] TEI started with PID $TEI_PID"
 else
@@ -107,7 +109,7 @@ python3 -m vllm.entrypoints.openai.api_server \
   --max-num-seqs ${maxNumSeqs} \
   --cpu-offload-gb 0 \
   --trust-remote-code \
-  > /var/log/vllm.log 2>&1 &
+  2>&1 | tee -a /var/log/vllm.log &
 VLLM_PID=$!
 echo "[vast-combo] vLLM started with PID $VLLM_PID"
 

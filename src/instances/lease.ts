@@ -14,6 +14,13 @@
 // between "API created the instance" and "we recorded its id".
 // =============================================================================
 
+export interface LeaseService {
+  readonly name: string;
+  readonly containerPort: number;
+  readonly hostPort?: number;
+  readonly endpoint?: string;
+}
+
 /** A lease intent, written BEFORE the rent call. */
 export interface LeaseIntent {
   /** Unique, greppable label applied to the instance so a reaper can match it
@@ -31,11 +38,21 @@ export interface LeaseIntent {
   readonly expiresAtMs: number;
   /** Who/what created it (session, test name, operator). */
   readonly owner: string;
+  /** Container ports exposed by the workload (e.g. [8003, 8032] for combo). */
+  readonly ports?: readonly number[];
+  /** Named mesh services co-located on the instance. */
+  readonly services?: readonly LeaseService[];
 }
 
 /** A lease that has been confirmed against a real instance. */
 export interface Lease extends LeaseIntent {
   readonly instanceId: number;
+  /** Container port -> mapped public HostPort on the Vast host. */
+  readonly hostPorts?: Record<number, number>;
+  /** Public IP address of the rented instance. */
+  readonly publicIp?: string;
+  /** Named service endpoints (e.g. embedding: "http://...", qwen: "http://..."). */
+  readonly endpoints?: Record<string, string>;
 }
 
 export const LEASE_LABEL_PREFIX = "nocomesh-offload";
@@ -67,11 +84,32 @@ export function makeLeaseIntent(args: {
   owner: string;
   maxLifetimeMinutes: number;
   nowMs?: number;
+  ports?: readonly number[];
+  services?: readonly LeaseService[];
 }): LeaseIntent {
   const nowMs = args.nowMs ?? Date.now();
   if (!Number.isFinite(args.maxLifetimeMinutes) || args.maxLifetimeMinutes <= 0) {
     throw new Error("maxLifetimeMinutes must be a positive number");
   }
+
+  let ports = args.ports;
+  let services = args.services;
+  if (!ports && args.workload === "combo") {
+    ports = [8003, 8032];
+  }
+  if (!services) {
+    if (args.workload === "combo") {
+      services = [
+        { name: "embedding", containerPort: 8003 },
+        { name: "qwen", containerPort: 8032 },
+      ];
+    } else if (args.workload === "embedding") {
+      services = [{ name: "embedding", containerPort: 8003 }];
+    } else if (args.workload === "qwen") {
+      services = [{ name: "qwen", containerPort: 8032 }];
+    }
+  }
+
   return {
     label: buildLeaseLabel(args.workload, args.owner, nowMs),
     workload: args.workload,
@@ -80,6 +118,8 @@ export function makeLeaseIntent(args: {
     createdAtMs: nowMs,
     expiresAtMs: nowMs + args.maxLifetimeMinutes * 60_000,
     owner: args.owner,
+    ...(ports ? { ports } : {}),
+    ...(services ? { services } : {}),
   };
 }
 

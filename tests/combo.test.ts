@@ -148,8 +148,19 @@ describe("rentInstance with combo workload (src/instances/rent.ts)", () => {
     expect(putSpy).toHaveBeenCalledTimes(1);
     const [path, body] = putSpy.mock.calls[0] as [string, Record<string, unknown>];
     expect(path).toBe("/asks/301");
-    expect(body.ports).toEqual([8003, 8032]);
+    // Vast API honors port mapping via `-p` flags in `env` string
+    expect(body.env).toContain("-p 8003:8003 -p 8032:8032");
+    expect(body.runtype).toBe("args");
     expect(body.label).toContain("nocomesh-offload--combo--");
+
+    // Check dual-service mesh registration in Consul KV lease
+    expect(putLeaseSpy).toHaveBeenCalled();
+    const recordedLease = putLeaseSpy.mock.calls[putLeaseSpy.mock.calls.length - 1]?.[0];
+    expect(recordedLease.ports).toEqual([8003, 8032]);
+    expect(recordedLease.services).toEqual([
+      { name: "embedding", containerPort: 8003 },
+      { name: "qwen", containerPort: 8032 },
+    ]);
   });
 });
 

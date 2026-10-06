@@ -98,7 +98,7 @@ export const COMBO_WORKLOAD: WorkloadSpec = {
 
 export const COMBO_PORTS = [8003, 8032] as const;
 
-export const COMBO_IMAGE = "ghcr.io/buihongduc132/vllm-tei-combo:latest";
+export const COMBO_IMAGE = "ghcr.io/buihongduc132/vllm-tei-combo:v2";
 
 export const WORKLOADS: Readonly<Record<WorkloadId, WorkloadSpec>> = {
   embedding: EMBEDDING_WORKLOAD,
